@@ -1,0 +1,21 @@
+# secrets
+.env
+*.env
+
+# corporate private data - never commit
+private_docs/*
+!private_docs/.gitkeep
+storage/*
+!storage/.gitkeep
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# os / ide
+.DS_Store
+.idea/
+.vscode/
