@@ -160,6 +160,27 @@ def extract_sources_from_answer(answer: str) -> list[str]:
     return sources
 
 
+def remove_sources_from_answer(answer: str) -> str:
+    """
+    Убирает блок источников из ответа перед отправкой пользователю.
+
+    Было:
+    Ответ...
+
+    📎 Источники:
+    • file.pdf, стр. 3
+
+    Станет:
+    Ответ...
+    """
+    marker = "📎 Источники:"
+
+    if marker not in answer:
+        return answer.strip()
+
+    return answer.split(marker, maxsplit=1)[0].strip()
+
+
 def expected_paths_text() -> str:
     storage_dir = Path(settings.storage_dir)
     index_path = storage_dir / INDEX_FILE
@@ -306,7 +327,7 @@ async def cmd_start(message: Message) -> None:
 
     await message.answer(
         "Здравствуйте! Я корпоративный AI-ассистент.\n\n"
-        "Задайте вопрос, а я найду ответ в базе знаний. "
+        "Задайте вопрос, а я найду ответ в базе знаний PDF. "
         "Если информации в базе нет, я так и отвечу."
     )
 
@@ -318,7 +339,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Как пользоваться:\n"
         "1. Напишите вопрос обычным сообщением.\n"
-        "2. Я выполню поиск по базе.\n"
+        "2. Я выполню поиск по PDF-базе.\n"
         "3. Ответ будет сформирован только по найденным фрагментам.\n\n"
         "Основные команды:\n"
         "/id — узнать свой Telegram user_id\n"
@@ -902,13 +923,17 @@ async def handle_question(message: Message) -> None:
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     try:
-        answer = await rag_engine.answer(question)
+        full_answer = await rag_engine.answer(question)
     except Exception as exc:
         logger.exception("Ошибка при обработке вопроса")
         await message.answer(f"Произошла ошибка: {exc}")
         return
 
-    sources = extract_sources_from_answer(answer)
+    # Источники сохраняем для логов и feedback
+    sources = extract_sources_from_answer(full_answer)
+
+    # Пользователю отправляем ответ без блока "📎 Источники"
+    visible_answer = remove_sources_from_answer(full_answer)
 
     answer_id: str | None = None
 
@@ -922,11 +947,11 @@ async def handle_question(message: Message) -> None:
             username=username,
             full_name=full_name,
             question=question,
-            answer=answer,
+            answer=visible_answer,
             sources=sources,
         )
 
-    parts = split_for_telegram(answer)
+    parts = split_for_telegram(visible_answer)
 
     for index, part in enumerate(parts):
         is_last_part = index == len(parts) - 1
