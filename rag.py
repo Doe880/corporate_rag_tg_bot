@@ -83,11 +83,17 @@ STOPWORDS = {
 
 IMPORTANT_FIELDS = {
     "слоган",
+    "девиз",
     "состав",
+    "компоненты",
+    "вещество",
+    "вещества",
     "противопоказания",
     "показания",
     "дозировка",
     "применение",
+    "прием",
+    "принимать",
     "рекомендации",
     "сообщение",
     "форма",
@@ -99,6 +105,177 @@ IMPORTANT_FIELDS = {
     "аналоги",
     "преимущества",
     "выгода",
+}
+
+
+# Query expansion:
+# Если пользователь задаёт вопрос другими словами,
+# бот расширяет запрос синонимами и близкими формулировками.
+QUERY_EXPANSIONS = {
+    "слоган": [
+        "девиз",
+        "ключевая фраза",
+        "ключевое сообщение",
+        "коммуникация",
+        "позиционирование",
+    ],
+    "девиз": [
+        "слоган",
+        "ключевая фраза",
+        "ключевое сообщение",
+        "коммуникация",
+        "позиционирование",
+    ],
+    "состав": [
+        "компоненты",
+        "активные вещества",
+        "ингредиенты",
+        "вещество",
+        "вещества",
+        "формула",
+    ],
+    "компоненты": [
+        "состав",
+        "активные вещества",
+        "ингредиенты",
+        "вещество",
+        "вещества",
+        "формула",
+    ],
+    "вещество": [
+        "состав",
+        "компоненты",
+        "активные вещества",
+        "ингредиенты",
+    ],
+    "вещества": [
+        "состав",
+        "компоненты",
+        "активные вещества",
+        "ингредиенты",
+    ],
+    "применение": [
+        "как принимать",
+        "прием",
+        "способ применения",
+        "рекомендации",
+        "дозировка",
+        "курс",
+    ],
+    "принимать": [
+        "применение",
+        "прием",
+        "способ применения",
+        "рекомендации",
+        "дозировка",
+        "курс",
+    ],
+    "прием": [
+        "применение",
+        "как принимать",
+        "способ применения",
+        "рекомендации",
+        "дозировка",
+        "курс",
+    ],
+    "дозировка": [
+        "доза",
+        "прием",
+        "как принимать",
+        "способ применения",
+        "применение",
+    ],
+    "показания": [
+        "для чего",
+        "кому подходит",
+        "назначение",
+        "применение",
+        "рекомендации",
+    ],
+    "противопоказания": [
+        "нельзя",
+        "ограничения",
+        "кому нельзя",
+        "не рекомендуется",
+        "предостережения",
+    ],
+    "форма": [
+        "форма выпуска",
+        "выпуск",
+        "упаковка",
+        "таблетки",
+        "капсулы",
+        "саше",
+    ],
+    "выпуска": [
+        "форма выпуска",
+        "выпуск",
+        "упаковка",
+        "таблетки",
+        "капсулы",
+        "саше",
+    ],
+    "упаковка": [
+        "форма выпуска",
+        "выпуск",
+        "количество",
+        "таблетки",
+        "капсулы",
+        "саше",
+    ],
+    "преимущества": [
+        "выгоды",
+        "плюсы",
+        "отличия",
+        "сильные стороны",
+        "польза",
+    ],
+    "выгоды": [
+        "преимущества",
+        "плюсы",
+        "отличия",
+        "сильные стороны",
+        "польза",
+    ],
+    "отличия": [
+        "преимущества",
+        "аналоги",
+        "конкуренты",
+        "чем отличается",
+        "сравнение",
+    ],
+    "аналоги": [
+        "конкуренты",
+        "сравнение",
+        "отличия",
+        "похожие продукты",
+    ],
+    "эффективность": [
+        "результат",
+        "доказательства",
+        "исследования",
+        "данные",
+        "эффект",
+    ],
+    "исследования": [
+        "данные",
+        "доказательства",
+        "эффективность",
+        "результаты",
+    ],
+    "сообщение": [
+        "ключевое сообщение",
+        "слоган",
+        "девиз",
+        "позиционирование",
+        "коммуникация",
+    ],
+    "позиционирование": [
+        "слоган",
+        "девиз",
+        "ключевое сообщение",
+        "коммуникация",
+    ],
 }
 
 
@@ -125,6 +302,77 @@ def tokenize(text: str) -> list[str]:
         for token in tokens
         if token not in STOPWORDS and len(token) >= 2
     ]
+
+
+def unique_preserve_order(items: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for item in items:
+        if item in seen:
+            continue
+
+        seen.add(item)
+        result.append(item)
+
+    return result
+
+
+def expand_query_tokens(question: str) -> tuple[list[str], list[str], str]:
+    """
+    Возвращает:
+    1. original_tokens — токены исходного вопроса
+    2. expanded_tokens — исходные токены + расширенные токены
+    3. expanded_text — текст вопроса + расширенные слова
+
+    Пример:
+    вопрос: "девиз продукта"
+    expanded_tokens: ["девиз", "продукта", "слоган", "ключевая", "фраза", ...]
+    """
+    original_tokens = tokenize(question)
+    expanded_tokens: list[str] = []
+
+    for token in original_tokens:
+        expanded_tokens.append(token)
+
+        expansions = QUERY_EXPANSIONS.get(token, [])
+
+        for phrase in expansions:
+            expanded_tokens.extend(tokenize(phrase))
+
+    expanded_tokens = unique_preserve_order(expanded_tokens)
+
+    additional_tokens = [
+        token
+        for token in expanded_tokens
+        if token not in original_tokens
+    ]
+
+    if additional_tokens:
+        expanded_text = question + " " + " ".join(additional_tokens)
+    else:
+        expanded_text = question
+
+    return original_tokens, expanded_tokens, expanded_text
+
+
+def build_query_token_weights(
+    original_tokens: list[str],
+    expanded_tokens: list[str],
+) -> dict[str, float]:
+    """
+    Вес исходных токенов выше, вес расширенных токенов ниже.
+    Это нужно, чтобы query expansion помогал, но не перебивал исходный смысл вопроса.
+    """
+    weights: dict[str, float] = {}
+
+    for token in expanded_tokens:
+        weights[token] = 0.6
+
+    for token in original_tokens:
+        weights[token] = 1.0
+
+    return weights
 
 
 def safe_float(value: float | int | None, default: float = 0.0) -> float:
@@ -304,16 +552,28 @@ class RAGEngine:
         limit: int,
     ) -> list[dict]:
         """
-        BM25-поиск по chunks.
-        Заменяет простой keyword search.
+        BM25-поиск по chunks с query expansion.
+
+        Исходный вопрос:
+        "девиз продукта"
+
+        Расширенный поиск:
+        "девиз продукта слоган ключевая фраза ключевое сообщение ..."
         """
-        query_tokens = tokenize(question)
+        original_tokens, expanded_tokens, expanded_text = expand_query_tokens(question)
         normalized_question = normalize_text_for_search(question)
 
-        if not query_tokens:
+        if not expanded_tokens:
             return []
 
-        query_token_set = set(query_tokens)
+        token_weights = build_query_token_weights(
+            original_tokens=original_tokens,
+            expanded_tokens=expanded_tokens,
+        )
+
+        original_token_set = set(original_tokens)
+        expanded_token_set = set(expanded_tokens)
+
         results: list[dict] = []
 
         avg_doc_len = self.bm25_avg_doc_len or 1.0
@@ -325,53 +585,71 @@ class RAGEngine:
             text = item["normalized_text"]
 
             # Быстрый пропуск: если нет ни одного совпадающего термина.
-            if not query_token_set.intersection(token_set):
+            if not expanded_token_set.intersection(token_set):
                 continue
 
             bm25_score = 0.0
 
-            for token in query_tokens:
+            for token in expanded_tokens:
                 tf = token_counts.get(token, 0)
 
                 if tf <= 0:
                     continue
 
                 idf = self.bm25_idf.get(token, 0.0)
+                weight = token_weights.get(token, 0.6)
 
                 denominator = tf + BM25_K1 * (
                     1 - BM25_B + BM25_B * (doc_len / avg_doc_len)
                 )
 
-                bm25_score += idf * ((tf * (BM25_K1 + 1)) / denominator)
+                bm25_score += weight * idf * ((tf * (BM25_K1 + 1)) / denominator)
 
-            # Дополнительные бонусы поверх BM25 для продуктовых книг и полей вида "Слоган:"
+            # Дополнительные бонусы поверх BM25.
             exact_phrase_bonus = 0.0
             field_bonus = 0.0
-            all_terms_bonus = 0.0
+            all_original_terms_bonus = 0.0
             important_field_bonus = 0.0
+            expansion_match_bonus = 0.0
 
             if normalized_question and normalized_question in text:
                 exact_phrase_bonus = 5.0
 
-            for token in query_tokens:
+            # Если совпадает поле из исходного вопроса, даём сильный бонус.
+            for token in original_tokens:
                 if f"{token}:" in text:
                     field_bonus += 3.0
 
-            if all(token in token_set for token in query_tokens):
-                all_terms_bonus = 2.0
+            # Если совпадает поле из расширенного запроса, даём более слабый бонус.
+            for token in expanded_tokens:
+                if token in original_token_set:
+                    continue
 
-            matched_important_fields = IMPORTANT_FIELDS.intersection(query_token_set)
+                if f"{token}:" in text:
+                    field_bonus += 1.5
+
+            if original_tokens and all(token in token_set for token in original_tokens):
+                all_original_terms_bonus = 2.0
+
+            matched_important_fields = IMPORTANT_FIELDS.intersection(expanded_token_set)
 
             for field in matched_important_fields:
                 if field in token_set:
                     important_field_bonus += 2.0
 
+            # Если расширение помогло найти термин, которого не было в исходном запросе.
+            expanded_only_tokens = expanded_token_set - original_token_set
+
+            if expanded_only_tokens.intersection(token_set):
+                expansion_match_bonus = 1.0
+
             final_bm25_score = (
                 bm25_score
                 + exact_phrase_bonus
                 + field_bonus
-                + all_terms_bonus
+                + all_original_terms_bonus
                 + important_field_bonus
+                + expansion_match_bonus
             )
 
             if final_bm25_score <= 0:
@@ -390,6 +668,7 @@ class RAGEngine:
                     "page": item["page"],
                     "chunk_no": item["chunk_no"],
                     "text": item["text"],
+                    "expanded_query": expanded_text,
                 }
             )
 
@@ -434,6 +713,9 @@ class RAGEngine:
 
             existing["search_types"].update(result.get("search_types", set()))
 
+            if result.get("expanded_query"):
+                existing["expanded_query"] = result["expanded_query"]
+
         for result in vector_results:
             add_result(result)
 
@@ -453,7 +735,9 @@ class RAGEngine:
         Учитывает:
         - vector_score
         - bm25_score
-        - покрытие слов запроса
+        - query expansion
+        - покрытие слов исходного запроса
+        - покрытие слов расширенного запроса
         - точное совпадение фразы
         - поля вида "Слоган:"
         - найден ли chunk сразу двумя способами
@@ -461,8 +745,12 @@ class RAGEngine:
         if not candidates:
             return []
 
-        query_tokens = tokenize(question)
-        query_token_set = set(query_tokens)
+        original_tokens, expanded_tokens, _expanded_text = expand_query_tokens(question)
+
+        original_token_set = set(original_tokens)
+        expanded_token_set = set(expanded_tokens)
+        expanded_only_token_set = expanded_token_set - original_token_set
+
         normalized_question = normalize_text_for_search(question)
 
         max_bm25 = max(safe_float(item.get("bm25_score")) for item in candidates) or 1.0
@@ -492,28 +780,44 @@ class RAGEngine:
             # Нормализация BM25.
             bm25_norm = bm25_score / max_bm25 if max_bm25 else 0.0
 
-            # Покрытие запроса: сколько значимых слов вопроса есть в chunk.
-            if query_token_set:
-                coverage = len(query_token_set.intersection(token_set)) / len(query_token_set)
+            # Покрытие исходного запроса.
+            if original_token_set:
+                original_coverage = len(original_token_set.intersection(token_set)) / len(original_token_set)
             else:
-                coverage = 0.0
+                original_coverage = 0.0
+
+            # Покрытие расширенного запроса.
+            if expanded_token_set:
+                expanded_coverage = len(expanded_token_set.intersection(token_set)) / len(expanded_token_set)
+            else:
+                expanded_coverage = 0.0
+
+            # Query expansion не должен перебивать исходный вопрос,
+            # поэтому исходное покрытие весит сильнее.
+            coverage = 0.75 * original_coverage + 0.25 * expanded_coverage
 
             # Бонус за точную фразу.
             exact_phrase_bonus = 0.0
+
             if normalized_question and normalized_question in normalized_text:
                 exact_phrase_bonus = 0.15
 
             # Бонус за поля вида "слоган:", "состав:".
             field_bonus = 0.0
-            for token in query_tokens:
+
+            for token in original_tokens:
                 if f"{token}:" in normalized_text:
                     field_bonus += 0.10
+
+            for token in expanded_only_token_set:
+                if f"{token}:" in normalized_text:
+                    field_bonus += 0.05
 
             field_bonus = min(field_bonus, 0.25)
 
             # Бонус за важные поля.
             important_bonus = 0.0
-            matched_important = IMPORTANT_FIELDS.intersection(query_token_set)
+            matched_important = IMPORTANT_FIELDS.intersection(expanded_token_set)
 
             for field in matched_important:
                 if field in token_set:
@@ -521,18 +825,25 @@ class RAGEngine:
 
             important_bonus = min(important_bonus, 0.15)
 
+            # Бонус, если query expansion реально помог найти совпадение.
+            expansion_bonus = 0.0
+
+            if expanded_only_token_set.intersection(token_set):
+                expansion_bonus = 0.08
+
             # Бонус, если chunk найден и в vector, и в BM25.
             search_types = item.get("search_types", set())
             both_search_bonus = 0.10 if len(search_types) > 1 else 0.0
 
             # Финальный rerank score.
             rerank_score = (
-                0.50 * vector_norm
-                + 0.35 * bm25_norm
-                + 0.15 * coverage
+                0.48 * vector_norm
+                + 0.34 * bm25_norm
+                + 0.18 * coverage
                 + exact_phrase_bonus
                 + field_bonus
                 + important_bonus
+                + expansion_bonus
                 + both_search_bonus
             )
 
@@ -540,6 +851,8 @@ class RAGEngine:
             item["rank_score"] = rerank_score
             item["score"] = rerank_score
             item["coverage"] = coverage
+            item["original_coverage"] = original_coverage
+            item["expanded_coverage"] = expanded_coverage
             item["vector_norm"] = vector_norm
             item["bm25_norm"] = bm25_norm
 
@@ -557,7 +870,7 @@ class RAGEngine:
         """
         Новый поиск:
         1. Vector search
-        2. BM25 search
+        2. BM25 search с query expansion
         3. Merge candidates
         4. Reranking
         5. TOP_K лучших chunks
@@ -666,6 +979,8 @@ QUESTION:
             used.add(key)
             sources.append(f"• {hit['file_name']}, стр. {hit['page']}")
 
+        # Источники добавляются в технический ответ,
+        # но bot.py скрывает их от пользователя и сохраняет в логи.
         final_answer = f"{answer_text}\n\n📎 Источники:\n" + "\n".join(sources)
 
         self.cache.add(
@@ -698,6 +1013,7 @@ QUESTION:
             "min_relevance_score": settings.min_relevance_score,
             "bm25_docs": len(self.bm25_index),
             "bm25_avg_doc_len": round(self.bm25_avg_doc_len, 2),
+            "query_expansion_terms": len(QUERY_EXPANSIONS),
         }
 
     def get_version_text(self) -> str:
@@ -710,6 +1026,7 @@ QUESTION:
             f"Chunks: <code>{status['chunks_count']}</code>\n"
             f"BM25 docs: <code>{status['bm25_docs']}</code>\n"
             f"BM25 avg doc len: <code>{status['bm25_avg_doc_len']}</code>\n"
+            f"Query expansion terms: <code>{status['query_expansion_terms']}</code>\n"
             f"Embeddings shape: <code>{status['embeddings_shape']}</code>\n"
             f"Embedding model: <code>{status['embedding_model']}</code>"
         )
