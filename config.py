@@ -25,12 +25,6 @@ def _get_float(name: str, default: float) -> float:
 
 
 def _get_int_set(name: str) -> set[int]:
-    """
-    Читает список ID из переменной окружения.
-
-    Пример:
-    ADMIN_USER_IDS=123456789,987654321
-    """
     raw = os.getenv(name, "").strip()
 
     if not raw:
@@ -69,6 +63,7 @@ class Settings:
 
     private_docs_dir: str
     storage_dir: str
+    logs_dir: str
 
     chunk_size_tokens: int
     chunk_overlap_tokens: int
@@ -95,6 +90,7 @@ settings = Settings(
 
     private_docs_dir=os.getenv("PRIVATE_DOCS_DIR", "private_docs"),
     storage_dir=storage_dir,
+    logs_dir=os.getenv("LOGS_DIR", str(Path(storage_dir) / "logs")),
 
     chunk_size_tokens=_get_int("CHUNK_SIZE_TOKENS", 350),
     chunk_overlap_tokens=_get_int("CHUNK_OVERLAP_TOKENS", 70),

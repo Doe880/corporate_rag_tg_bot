@@ -12,6 +12,7 @@ from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from analytics import AnalyticsStore
 from auth import AuthStore
 from config import settings
 from ingest import CHUNKS_FILE, INDEX_FILE
@@ -22,9 +23,14 @@ logger = logging.getLogger(__name__)
 
 rag_engine: RAGEngine | None = None
 auth_store: AuthStore | None = None
+analytics_store: AnalyticsStore | None = None
 
 
 def split_for_telegram(text: str, limit: int = 3900) -> list[str]:
+    """
+    Telegram ограничивает длину одного сообщения.
+    Делим длинный ответ на части.
+    """
     parts: list[str] = []
 
     while len(text) > limit:
@@ -103,6 +109,69 @@ def auth_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 ),
             ]
         ]
+    )
+
+
+def feedback_keyboard(answer_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👍 Полезно",
+                    callback_data=f"fb:good:{answer_id}",
+                ),
+                InlineKeyboardButton(
+                    text="👎 Неверно",
+                    callback_data=f"fb:bad:{answer_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def extract_sources_from_answer(answer: str) -> list[str]:
+    """
+    Достаёт источники из текста ответа.
+
+    Ожидаемый формат:
+    📎 Источники:
+    • file.pdf, стр. 3
+    """
+    marker = "📎 Источники:"
+
+    if marker not in answer:
+        return []
+
+    sources_block = answer.split(marker, maxsplit=1)[1]
+
+    sources: list[str] = []
+
+    for line in sources_block.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        line = line.lstrip("•").strip()
+
+        if line:
+            sources.append(line)
+
+    return sources
+
+
+def expected_paths_text() -> str:
+    storage_dir = Path(settings.storage_dir)
+    index_path = storage_dir / INDEX_FILE
+    chunks_path = storage_dir / CHUNKS_FILE
+    cache_file = os.getenv("CACHE_FILE", "answer_cache.json")
+    cache_path = storage_dir / cache_file
+
+    return (
+        f"STORAGE_DIR: <code>{escape(str(storage_dir))}</code>\n"
+        f"index.npz: <code>{escape(str(index_path))}</code>\n"
+        f"chunks.json: <code>{escape(str(chunks_path))}</code>\n"
+        f"cache: <code>{escape(str(cache_path))}</code>"
     )
 
 
@@ -212,34 +281,21 @@ async def ensure_admin(message: Message) -> bool:
     return True
 
 
-def expected_paths_text() -> str:
-    storage_dir = Path(settings.storage_dir)
-    index_path = storage_dir / INDEX_FILE
-    chunks_path = storage_dir / CHUNKS_FILE
-    cache_file = os.getenv("CACHE_FILE", "answer_cache.json")
-    cache_path = storage_dir / cache_file
-
-    return (
-        f"STORAGE_DIR: <code>{escape(str(storage_dir))}</code>\n"
-        f"index.npz: <code>{escape(str(index_path))}</code>\n"
-        f"chunks.json: <code>{escape(str(chunks_path))}</code>\n"
-        f"cache: <code>{escape(str(cache_path))}</code>"
-    )
-
-
 async def cmd_id(message: Message) -> None:
     if message.from_user is None:
         await message.answer("Не удалось определить ваш Telegram user_id.")
         return
 
     user_id = message.from_user.id
-    username = message.from_user.username or "не указан"
+    username = message.from_user.username
     full_name = escape(message.from_user.full_name or "")
+
+    username_text = f"@{escape(username)}" if username else "не указан"
 
     await message.answer(
         "Ваши данные Telegram:\n\n"
         f"User ID: <code>{user_id}</code>\n"
-        f"Username: @{escape(username)}\n"
+        f"Username: {username_text}\n"
         f"Имя: {full_name}"
     )
 
@@ -250,7 +306,7 @@ async def cmd_start(message: Message) -> None:
 
     await message.answer(
         "Здравствуйте! Я корпоративный AI-ассистент.\n\n"
-        "Задайте вопрос, а я найду ответ в базе знаний PDF. "
+        "Задайте вопрос, а я найду ответ в базе знаний. "
         "Если информации в базе нет, я так и отвечу."
     )
 
@@ -262,21 +318,26 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Как пользоваться:\n"
         "1. Напишите вопрос обычным сообщением.\n"
-        "2. Я выполню поиск по PDF-базе.\n"
+        "2. Я выполню поиск по базе.\n"
         "3. Ответ будет сформирован только по найденным фрагментам.\n\n"
-        "Команды:\n"
+        "Основные команды:\n"
         "/id — узнать свой Telegram user_id\n"
         "/help — помощь\n\n"
-        "Админ-команды:\n"
+        "Админ-команды RAG:\n"
         "/status — статус базы знаний\n"
         "/reload — перезагрузить базу без перезапуска контейнера\n"
         "/clear_cache — очистить кэш ответов\n"
         "/version — версия базы знаний\n"
-        "/debug_search запрос — показать найденные chunks\n"
+        "/debug_search запрос — показать найденные chunks\n\n"
+        "Админ-команды авторизации:\n"
         "/users — список пользователей\n"
         "/pending — список заявок\n"
         "/allow user_id — добавить пользователя\n"
-        "/revoke user_id — удалить пользователя"
+        "/revoke user_id — удалить пользователя\n\n"
+        "Админ-команды аналитики:\n"
+        "/stats — статистика\n"
+        "/popular — популярные запросы\n"
+        "/feedback — последние негативные оценки"
     )
 
 
@@ -312,6 +373,12 @@ async def cmd_status(message: Message) -> None:
         f"TOP_K: <code>{status['top_k']}</code>\n"
         f"MIN_RELEVANCE_SCORE: <code>{status['min_relevance_score']}</code>"
     )
+
+    if "bm25_docs" in status:
+        text += (
+            f"\nBM25 docs: <code>{status['bm25_docs']}</code>"
+            f"\nBM25 avg doc len: <code>{status['bm25_avg_doc_len']}</code>"
+        )
 
     await message.answer(text)
 
@@ -573,6 +640,98 @@ async def cmd_revoke(message: Message) -> None:
         await message.answer(f"⚠️ {text}\nUser ID: <code>{user_id}</code>")
 
 
+async def cmd_stats(message: Message) -> None:
+    global analytics_store
+
+    if not await ensure_admin(message):
+        return
+
+    if analytics_store is None:
+        await message.answer("Система аналитики не инициализирована.")
+        return
+
+    stats = analytics_store.get_stats()
+
+    text = (
+        "📊 Статистика бота\n\n"
+        f"Всего запросов: <code>{stats['total_queries']}</code>\n"
+        f"Уникальных пользователей: <code>{stats['unique_users']}</code>\n"
+        f"Всего оценок: <code>{stats['total_feedback']}</code>\n"
+        f"👍 Полезно: <code>{stats['good_feedback']}</code>\n"
+        f"👎 Неверно: <code>{stats['bad_feedback']}</code>\n\n"
+        f"Query log: <code>{escape(stats['query_log_path'])}</code>\n"
+        f"Feedback log: <code>{escape(stats['feedback_log_path'])}</code>"
+    )
+
+    await message.answer(text)
+
+
+async def cmd_popular(message: Message) -> None:
+    global analytics_store
+
+    if not await ensure_admin(message):
+        return
+
+    if analytics_store is None:
+        await message.answer("Система аналитики не инициализирована.")
+        return
+
+    items = analytics_store.get_popular_queries(limit=10)
+
+    if not items:
+        await message.answer("Пока нет статистики по запросам.")
+        return
+
+    lines = ["🔥 Самые популярные запросы:\n"]
+
+    for index, item in enumerate(items, start=1):
+        question = escape(item["question"])
+        count = item["count"]
+
+        lines.append(f"{index}. <code>{count}</code> — {question}")
+
+    await message.answer("\n".join(lines))
+
+
+async def cmd_feedback(message: Message) -> None:
+    global analytics_store
+
+    if not await ensure_admin(message):
+        return
+
+    if analytics_store is None:
+        await message.answer("Система аналитики не инициализирована.")
+        return
+
+    items = analytics_store.get_recent_bad_feedback(limit=5)
+
+    if not items:
+        await message.answer("Негативных оценок пока нет.")
+        return
+
+    lines = ["👎 Последние ответы с оценкой «Неверно»:\n"]
+
+    for index, item in enumerate(items, start=1):
+        question = escape(str(item.get("question", "")))
+        sources = item.get("sources") or []
+        created_at = escape(str(item.get("created_at", "")))
+        user_id = item.get("original_user_id")
+
+        sources_text = "; ".join(sources) if sources else "источники не указаны"
+
+        lines.append(
+            f"{index}. Дата: <code>{created_at}</code>\n"
+            f"User ID: <code>{user_id}</code>\n"
+            f"Вопрос: {question}\n"
+            f"Источники: {escape(sources_text)}\n"
+        )
+
+    text = "\n".join(lines)
+
+    for part in split_for_telegram(text):
+        await message.answer(part)
+
+
 async def handle_auth_callback(callback: CallbackQuery) -> None:
     global auth_store
 
@@ -665,8 +824,63 @@ async def handle_auth_callback(callback: CallbackQuery) -> None:
     await callback.answer("Неизвестное действие.", show_alert=True)
 
 
+async def handle_feedback_callback(callback: CallbackQuery) -> None:
+    global analytics_store
+    global auth_store
+
+    if analytics_store is None:
+        await callback.answer("Система аналитики не инициализирована.", show_alert=True)
+        return
+
+    if auth_store is None:
+        await callback.answer("Система авторизации не инициализирована.", show_alert=True)
+        return
+
+    user_id = get_callback_user_id(callback)
+
+    if not auth_store.is_allowed(user_id):
+        await callback.answer("У вас нет доступа.", show_alert=True)
+        return
+
+    data = callback.data or ""
+    parts = data.split(":")
+
+    if len(parts) != 3:
+        await callback.answer("Некорректная оценка.", show_alert=True)
+        return
+
+    _, feedback, answer_id = parts
+
+    if feedback not in {"good", "bad"}:
+        await callback.answer("Некорректная оценка.", show_alert=True)
+        return
+
+    success, _record = analytics_store.log_feedback(
+        answer_id=answer_id,
+        feedback=feedback,
+        feedback_user_id=user_id,
+    )
+
+    if not success:
+        await callback.answer("Не удалось найти ответ для оценки.", show_alert=True)
+        return
+
+    if feedback == "good":
+        await callback.answer("Спасибо за оценку 👍")
+    else:
+        await callback.answer("Спасибо. Я сохранил этот ответ для проверки 👎")
+
+    # Убираем кнопки, чтобы пользователь не нажимал несколько раз
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            logger.exception("Не удалось убрать feedback-кнопки")
+
+
 async def handle_question(message: Message) -> None:
     global rag_engine
+    global analytics_store
 
     if not await ensure_access(message):
         return
@@ -694,15 +908,45 @@ async def handle_question(message: Message) -> None:
         await message.answer(f"Произошла ошибка: {exc}")
         return
 
-    for part in split_for_telegram(answer):
-        await message.answer(part)
+    sources = extract_sources_from_answer(answer)
+
+    answer_id: str | None = None
+
+    if analytics_store is not None:
+        username = message.from_user.username if message.from_user else None
+        full_name = message.from_user.full_name if message.from_user else None
+        user_id = get_user_id(message)
+
+        answer_id = analytics_store.log_query(
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            question=question,
+            answer=answer,
+            sources=sources,
+        )
+
+    parts = split_for_telegram(answer)
+
+    for index, part in enumerate(parts):
+        is_last_part = index == len(parts) - 1
+
+        if is_last_part and answer_id:
+            await message.answer(
+                part,
+                reply_markup=feedback_keyboard(answer_id),
+            )
+        else:
+            await message.answer(part)
 
 
 async def main() -> None:
     global rag_engine
     global auth_store
+    global analytics_store
 
     auth_store = AuthStore()
+    analytics_store = AnalyticsStore()
 
     if not settings.admin_user_ids:
         logger.warning(
@@ -729,11 +973,14 @@ async def main() -> None:
 
     dp = Dispatcher()
 
-    # Команды, доступные всемм
+    # Команды, доступные всем
     dp.message.register(cmd_id, Command("id"))
 
     # Callback-кнопки авторизации
     dp.callback_query.register(handle_auth_callback, F.data.startswith("auth:"))
+
+    # Callback-кнопки оценки ответов
+    dp.callback_query.register(handle_feedback_callback, F.data.startswith("fb:"))
 
     # Обычные команды
     dp.message.register(cmd_start, CommandStart())
@@ -751,6 +998,11 @@ async def main() -> None:
     dp.message.register(cmd_pending, Command("pending"))
     dp.message.register(cmd_allow, Command("allow"))
     dp.message.register(cmd_revoke, Command("revoke"))
+
+    # Админ-команды аналитики
+    dp.message.register(cmd_stats, Command("stats"))
+    dp.message.register(cmd_popular, Command("popular"))
+    dp.message.register(cmd_feedback, Command("feedback"))
 
     # Все остальные текстовые сообщения — вопросы к RAG
     dp.message.register(handle_question, F.text)
