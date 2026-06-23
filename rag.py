@@ -450,7 +450,7 @@ QUESTION:
 
     def get_version_text(self) -> str:
         """
-        Короткая информация о версии базы знаний.
+        Короткаяz информация о версии базы знаний.
         """
         status = self.get_status()
 

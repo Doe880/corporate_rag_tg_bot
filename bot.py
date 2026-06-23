@@ -729,7 +729,7 @@ async def main() -> None:
 
     dp = Dispatcher()
 
-    # Команды, доступные всем
+    # Команды, доступные всемм
     dp.message.register(cmd_id, Command("id"))
 
     # Callback-кнопки авторизации
