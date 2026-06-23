@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections import Counter
 from pathlib import Path
@@ -80,6 +81,31 @@ STOPWORDS = {
 }
 
 
+IMPORTANT_FIELDS = {
+    "слоган",
+    "состав",
+    "противопоказания",
+    "показания",
+    "дозировка",
+    "применение",
+    "рекомендации",
+    "сообщение",
+    "форма",
+    "выпуска",
+    "описание",
+    "имидж",
+    "ключевое",
+    "эффективность",
+    "аналоги",
+    "преимущества",
+    "выгода",
+}
+
+
+BM25_K1 = 1.5
+BM25_B = 0.75
+
+
 def normalize_text_for_search(text: str) -> str:
     text = text.lower()
     text = text.replace("ё", "е")
@@ -101,6 +127,16 @@ def tokenize(text: str) -> list[str]:
     ]
 
 
+def safe_float(value: float | int | None, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+
+        return float(value)
+    except Exception:
+        return default
+
+
 class RAGEngine:
     def __init__(self) -> None:
         self.client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -112,7 +148,11 @@ class RAGEngine:
         self.embeddings: np.ndarray
         self.chunks: list[dict]
         self.knowledge_base_hash: str
-        self.keyword_index: list[dict]
+
+        self.bm25_index: list[dict]
+        self.bm25_idf: dict[str, float]
+        self.bm25_avg_doc_len: float
+
         self.cache: AnswerCache
 
         self.reload()
@@ -125,7 +165,8 @@ class RAGEngine:
         self.embeddings = self._load_embeddings()
         self.chunks = self._load_chunks()
         self.knowledge_base_hash = file_sha256(self.chunks_path)
-        self.keyword_index = self._build_keyword_index()
+
+        self.bm25_index, self.bm25_idf, self.bm25_avg_doc_len = self._build_bm25_index()
 
         self.cache = AnswerCache(
             storage_dir=self.storage_dir,
@@ -133,10 +174,11 @@ class RAGEngine:
         )
 
         logger.info(
-            "RAG reloaded. chunks=%s, embeddings_shape=%s, kb_hash=%s",
+            "RAG reloaded. chunks=%s, embeddings_shape=%s, kb_hash=%s, bm25_docs=%s",
             len(self.chunks),
             self.embeddings.shape,
             self.knowledge_base_hash[:12],
+            len(self.bm25_index),
         )
 
     def _load_embeddings(self) -> np.ndarray:
@@ -159,12 +201,28 @@ class RAGEngine:
         with open(self.chunks_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _build_keyword_index(self) -> list[dict]:
+    def _build_bm25_index(self) -> tuple[list[dict], dict[str, float], float]:
+        """
+        Строит BM25-индекс по chunks.
+
+        BM25 лучше простого keyword search, потому что учитывает:
+        - частоту слова в chunk
+        - редкость слова во всей базе
+        - длину документа/chunk
+        """
         index: list[dict] = []
+        doc_freq: Counter[str] = Counter()
+        total_doc_len = 0
 
         for chunk in self.chunks:
             text = chunk.get("text", "")
             tokens = tokenize(text)
+            token_counts = Counter(tokens)
+            token_set = set(tokens)
+            doc_len = len(tokens)
+
+            total_doc_len += doc_len
+            doc_freq.update(token_set)
 
             index.append(
                 {
@@ -174,12 +232,23 @@ class RAGEngine:
                     "chunk_no": chunk["chunk_no"],
                     "text": text,
                     "normalized_text": normalize_text_for_search(text),
-                    "token_counts": Counter(tokens),
-                    "token_set": set(tokens),
+                    "tokens": tokens,
+                    "token_counts": token_counts,
+                    "token_set": token_set,
+                    "doc_len": doc_len,
                 }
             )
 
-        return index
+        docs_count = len(index)
+        avg_doc_len = total_doc_len / docs_count if docs_count else 0.0
+
+        idf: dict[str, float] = {}
+
+        for token, df in doc_freq.items():
+            # Классическая сглаженная формула IDF для BM25.
+            idf[token] = math.log(1 + ((docs_count - df + 0.5) / (df + 0.5)))
+
+        return index, idf, avg_doc_len
 
     async def _embed_query(self, question: str) -> np.ndarray:
         response = await self.client.embeddings.create(
@@ -190,9 +259,16 @@ class RAGEngine:
         vector = np.array([response.data[0].embedding], dtype=np.float32)
         return normalize_vectors(vector)[0]
 
-    async def vector_search(self, question_vector: np.ndarray) -> list[dict]:
+    async def vector_search(
+        self,
+        question_vector: np.ndarray,
+        limit: int,
+    ) -> list[dict]:
+        """
+        Semantic/vector search через embeddings.
+        """
         scores = self.embeddings @ question_vector
-        top_indices = np.argsort(scores)[::-1][: settings.top_k]
+        top_indices = np.argsort(scores)[::-1][:limit]
 
         results: list[dict] = []
 
@@ -207,9 +283,12 @@ class RAGEngine:
             results.append(
                 {
                     "id": chunk["id"],
+                    "vector_score": score,
+                    "bm25_score": 0.0,
                     "score": score,
                     "rank_score": score,
                     "search_type": "vector",
+                    "search_types": {"vector"},
                     "file_name": chunk["file_name"],
                     "page": chunk["page"],
                     "chunk_no": chunk["chunk_no"],
@@ -219,85 +298,114 @@ class RAGEngine:
 
         return results
 
-    def keyword_search(self, question: str) -> list[dict]:
-        normalized_question = normalize_text_for_search(question)
+    def bm25_search(
+        self,
+        question: str,
+        limit: int,
+    ) -> list[dict]:
+        """
+        BM25-поиск по chunks.
+        Заменяет простой keyword search.
+        """
         query_tokens = tokenize(question)
+        normalized_question = normalize_text_for_search(question)
 
-        if not query_tokens and not normalized_question:
+        if not query_tokens:
             return []
 
+        query_token_set = set(query_tokens)
         results: list[dict] = []
 
-        important_fields = {
-            "слоган",
-            "состав",
-            "противопоказания",
-            "показания",
-            "дозировка",
-            "применение",
-            "рекомендации",
-            "сообщение",
-            "форма",
-            "выпуска",
-            "описание",
-            "имидж",
-        }
+        avg_doc_len = self.bm25_avg_doc_len or 1.0
 
-        for item in self.keyword_index:
-            score = 0.0
-
-            text = item["normalized_text"]
+        for item in self.bm25_index:
             token_counts: Counter = item["token_counts"]
             token_set: set[str] = item["token_set"]
+            doc_len = item["doc_len"] or 1
+            text = item["normalized_text"]
 
-            if normalized_question and normalized_question in text:
-                score += 20.0
+            # Быстрый пропуск: если нет ни одного совпадающего термина.
+            if not query_token_set.intersection(token_set):
+                continue
+
+            bm25_score = 0.0
 
             for token in query_tokens:
-                count = token_counts.get(token, 0)
+                tf = token_counts.get(token, 0)
 
-                if count:
-                    score += count * 3.0
+                if tf <= 0:
+                    continue
 
-            if query_tokens and all(token in token_set for token in query_tokens):
-                score += 8.0
+                idf = self.bm25_idf.get(token, 0.0)
+
+                denominator = tf + BM25_K1 * (
+                    1 - BM25_B + BM25_B * (doc_len / avg_doc_len)
+                )
+
+                bm25_score += idf * ((tf * (BM25_K1 + 1)) / denominator)
+
+            # Дополнительные бонусы поверх BM25 для продуктовых книг и полей вида "Слоган:"
+            exact_phrase_bonus = 0.0
+            field_bonus = 0.0
+            all_terms_bonus = 0.0
+            important_field_bonus = 0.0
+
+            if normalized_question and normalized_question in text:
+                exact_phrase_bonus = 5.0
 
             for token in query_tokens:
                 if f"{token}:" in text:
-                    score += 15.0
+                    field_bonus += 3.0
 
-            matched_important_fields = important_fields.intersection(query_tokens)
+            if all(token in token_set for token in query_tokens):
+                all_terms_bonus = 2.0
+
+            matched_important_fields = IMPORTANT_FIELDS.intersection(query_token_set)
 
             for field in matched_important_fields:
                 if field in token_set:
-                    score += 10.0
+                    important_field_bonus += 2.0
 
-            if score > 0:
-                results.append(
-                    {
-                        "id": item["id"],
-                        "score": score,
-                        "rank_score": min(score / 10.0, 2.0),
-                        "search_type": "keyword",
-                        "file_name": item["file_name"],
-                        "page": item["page"],
-                        "chunk_no": item["chunk_no"],
-                        "text": item["text"],
-                    }
-                )
+            final_bm25_score = (
+                bm25_score
+                + exact_phrase_bonus
+                + field_bonus
+                + all_terms_bonus
+                + important_field_bonus
+            )
 
-        results.sort(key=lambda x: x["rank_score"], reverse=True)
+            if final_bm25_score <= 0:
+                continue
 
-        return results[: max(settings.top_k, 10)]
+            results.append(
+                {
+                    "id": item["id"],
+                    "vector_score": 0.0,
+                    "bm25_score": final_bm25_score,
+                    "score": final_bm25_score,
+                    "rank_score": final_bm25_score,
+                    "search_type": "bm25",
+                    "search_types": {"bm25"},
+                    "file_name": item["file_name"],
+                    "page": item["page"],
+                    "chunk_no": item["chunk_no"],
+                    "text": item["text"],
+                }
+            )
 
-    async def search(
+        results.sort(key=lambda x: x["bm25_score"], reverse=True)
+
+        return results[:limit]
+
+    def merge_candidates(
         self,
-        question: str,
-        question_vector: np.ndarray,
+        vector_results: list[dict],
+        bm25_results: list[dict],
     ) -> list[dict]:
-        vector_results = await self.vector_search(question_vector)
-        keyword_results = self.keyword_search(question)
-
+        """
+        Объединяет результаты vector search и BM25.
+        Если chunk найден двумя способами, сохраняем оба score.
+        """
         combined: dict[int, dict] = {}
 
         def add_result(result: dict) -> None:
@@ -305,30 +413,178 @@ class RAGEngine:
 
             if chunk_id not in combined:
                 combined[chunk_id] = result.copy()
-                combined[chunk_id]["search_types"] = {result["search_type"]}
-            else:
-                combined[chunk_id]["rank_score"] += result["rank_score"]
-                combined[chunk_id]["search_types"].add(result["search_type"])
-                combined[chunk_id]["score"] = max(
-                    float(combined[chunk_id].get("score", 0)),
-                    float(result.get("score", 0)),
-                )
+                combined[chunk_id]["search_types"] = set(result.get("search_types", set()))
+                return
+
+            existing = combined[chunk_id]
+
+            existing["vector_score"] = max(
+                safe_float(existing.get("vector_score")),
+                safe_float(result.get("vector_score")),
+            )
+            existing["bm25_score"] = max(
+                safe_float(existing.get("bm25_score")),
+                safe_float(result.get("bm25_score")),
+            )
+
+            existing["score"] = max(
+                safe_float(existing.get("score")),
+                safe_float(result.get("score")),
+            )
+
+            existing["search_types"].update(result.get("search_types", set()))
 
         for result in vector_results:
             add_result(result)
 
-        for result in keyword_results:
+        for result in bm25_results:
             add_result(result)
 
-        final_results = list(combined.values())
+        return list(combined.values())
 
-        for result in final_results:
-            if len(result.get("search_types", set())) > 1:
-                result["rank_score"] += 0.5
+    def rerank_candidates(
+        self,
+        question: str,
+        candidates: list[dict],
+    ) -> list[dict]:
+        """
+        Локальный reranking найденных chunks.
 
-        final_results.sort(key=lambda x: x["rank_score"], reverse=True)
+        Учитывает:
+        - vector_score
+        - bm25_score
+        - покрытие слов запроса
+        - точное совпадение фразы
+        - поля вида "Слоган:"
+        - найден ли chunk сразу двумя способами
+        """
+        if not candidates:
+            return []
 
-        return final_results[: settings.top_k]
+        query_tokens = tokenize(question)
+        query_token_set = set(query_tokens)
+        normalized_question = normalize_text_for_search(question)
+
+        max_bm25 = max(safe_float(item.get("bm25_score")) for item in candidates) or 1.0
+
+        reranked: list[dict] = []
+
+        for item in candidates:
+            text = item.get("text", "")
+            normalized_text = normalize_text_for_search(text)
+            token_set = set(tokenize(text))
+
+            vector_score = safe_float(item.get("vector_score"))
+            bm25_score = safe_float(item.get("bm25_score"))
+
+            # Нормализация vector score.
+            if vector_score <= 0:
+                vector_norm = 0.0
+            elif vector_score >= settings.min_relevance_score:
+                vector_norm = min(
+                    1.0,
+                    (vector_score - settings.min_relevance_score)
+                    / max(1e-6, 1.0 - settings.min_relevance_score),
+                )
+            else:
+                vector_norm = 0.0
+
+            # Нормализация BM25.
+            bm25_norm = bm25_score / max_bm25 if max_bm25 else 0.0
+
+            # Покрытие запроса: сколько значимых слов вопроса есть в chunk.
+            if query_token_set:
+                coverage = len(query_token_set.intersection(token_set)) / len(query_token_set)
+            else:
+                coverage = 0.0
+
+            # Бонус за точную фразу.
+            exact_phrase_bonus = 0.0
+            if normalized_question and normalized_question in normalized_text:
+                exact_phrase_bonus = 0.15
+
+            # Бонус за поля вида "слоган:", "состав:".
+            field_bonus = 0.0
+            for token in query_tokens:
+                if f"{token}:" in normalized_text:
+                    field_bonus += 0.10
+
+            field_bonus = min(field_bonus, 0.25)
+
+            # Бонус за важные поля.
+            important_bonus = 0.0
+            matched_important = IMPORTANT_FIELDS.intersection(query_token_set)
+
+            for field in matched_important:
+                if field in token_set:
+                    important_bonus += 0.05
+
+            important_bonus = min(important_bonus, 0.15)
+
+            # Бонус, если chunk найден и в vector, и в BM25.
+            search_types = item.get("search_types", set())
+            both_search_bonus = 0.10 if len(search_types) > 1 else 0.0
+
+            # Финальный rerank score.
+            rerank_score = (
+                0.50 * vector_norm
+                + 0.35 * bm25_norm
+                + 0.15 * coverage
+                + exact_phrase_bonus
+                + field_bonus
+                + important_bonus
+                + both_search_bonus
+            )
+
+            item = item.copy()
+            item["rank_score"] = rerank_score
+            item["score"] = rerank_score
+            item["coverage"] = coverage
+            item["vector_norm"] = vector_norm
+            item["bm25_norm"] = bm25_norm
+
+            reranked.append(item)
+
+        reranked.sort(key=lambda x: x["rank_score"], reverse=True)
+
+        return reranked
+
+    async def search(
+        self,
+        question: str,
+        question_vector: np.ndarray,
+    ) -> list[dict]:
+        """
+        Новый поиск:
+        1. Vector search
+        2. BM25 search
+        3. Merge candidates
+        4. Reranking
+        5. TOP_K лучших chunks
+        """
+        candidate_limit = max(settings.top_k * 5, 25)
+
+        vector_results = await self.vector_search(
+            question_vector=question_vector,
+            limit=candidate_limit,
+        )
+
+        bm25_results = self.bm25_search(
+            question=question,
+            limit=candidate_limit,
+        )
+
+        candidates = self.merge_candidates(
+            vector_results=vector_results,
+            bm25_results=bm25_results,
+        )
+
+        reranked = self.rerank_candidates(
+            question=question,
+            candidates=candidates,
+        )
+
+        return reranked[: settings.top_k]
 
     async def debug_search(self, question: str) -> list[dict]:
         """
@@ -421,15 +677,9 @@ QUESTION:
         return final_answer
 
     def clear_cache(self) -> int:
-        """
-        Очищает кэш ответов.
-        """
         return self.cache.clear()
 
     def get_status(self) -> dict:
-        """
-        Возвращает технический статус RAG.
-        """
         return {
             "storage_dir": str(self.storage_dir),
             "index_path": str(self.index_path),
@@ -446,12 +696,11 @@ QUESTION:
             "embedding_model": settings.embedding_model,
             "top_k": settings.top_k,
             "min_relevance_score": settings.min_relevance_score,
+            "bm25_docs": len(self.bm25_index),
+            "bm25_avg_doc_len": round(self.bm25_avg_doc_len, 2),
         }
 
     def get_version_text(self) -> str:
-        """
-        Короткаяz информация о версии базы знаний.
-        """
         status = self.get_status()
 
         return (
@@ -459,6 +708,8 @@ QUESTION:
             f"Hash: <code>{status['knowledge_base_hash']}</code>\n"
             f"Short hash: <code>{status['knowledge_base_hash'][:12]}</code>\n"
             f"Chunks: <code>{status['chunks_count']}</code>\n"
+            f"BM25 docs: <code>{status['bm25_docs']}</code>\n"
+            f"BM25 avg doc len: <code>{status['bm25_avg_doc_len']}</code>\n"
             f"Embeddings shape: <code>{status['embeddings_shape']}</code>\n"
             f"Embedding model: <code>{status['embedding_model']}</code>"
         )
