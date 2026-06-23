@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from html import escape
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -12,6 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from auth import AuthStore
 from config import settings
+from ingest import CHUNKS_FILE, INDEX_FILE
 from rag import RAGEngine
 
 logging.basicConfig(level=logging.INFO)
@@ -209,6 +212,21 @@ async def ensure_admin(message: Message) -> bool:
     return True
 
 
+def expected_paths_text() -> str:
+    storage_dir = Path(settings.storage_dir)
+    index_path = storage_dir / INDEX_FILE
+    chunks_path = storage_dir / CHUNKS_FILE
+    cache_file = os.getenv("CACHE_FILE", "answer_cache.json")
+    cache_path = storage_dir / cache_file
+
+    return (
+        f"STORAGE_DIR: <code>{escape(str(storage_dir))}</code>\n"
+        f"index.npz: <code>{escape(str(index_path))}</code>\n"
+        f"chunks.json: <code>{escape(str(chunks_path))}</code>\n"
+        f"cache: <code>{escape(str(cache_path))}</code>"
+    )
+
+
 async def cmd_id(message: Message) -> None:
     if message.from_user is None:
         await message.answer("Не удалось определить ваш Telegram user_id.")
@@ -250,11 +268,207 @@ async def cmd_help(message: Message) -> None:
         "/id — узнать свой Telegram user_id\n"
         "/help — помощь\n\n"
         "Админ-команды:\n"
+        "/status — статус базы знаний\n"
+        "/reload — перезагрузить базу без перезапуска контейнера\n"
+        "/clear_cache — очистить кэш ответов\n"
+        "/version — версия базы знаний\n"
+        "/debug_search запрос — показать найденные chunks\n"
         "/users — список пользователей\n"
         "/pending — список заявок\n"
         "/allow user_id — добавить пользователя\n"
         "/revoke user_id — удалить пользователя"
     )
+
+
+async def cmd_status(message: Message) -> None:
+    global rag_engine
+
+    if not await ensure_admin(message):
+        return
+
+    if rag_engine is None:
+        await message.answer(
+            "⚠️ RAG-индекс не загружен.\n\n"
+            "Ожидаемые пути:\n"
+            f"{expected_paths_text()}\n\n"
+            "Проверьте, что index.npz и chunks.json загружены в STORAGE_DIR."
+        )
+        return
+
+    status = rag_engine.get_status()
+
+    text = (
+        "✅ RAG-индекс загружен\n\n"
+        f"Storage: <code>{escape(status['storage_dir'])}</code>\n"
+        f"Index exists: <code>{status['index_exists']}</code>\n"
+        f"Chunks exists: <code>{status['chunks_exists']}</code>\n"
+        f"Chunks count: <code>{status['chunks_count']}</code>\n"
+        f"Embeddings shape: <code>{status['embeddings_shape']}</code>\n"
+        f"KB hash: <code>{status['knowledge_base_hash'][:12]}</code>\n"
+        f"Cache enabled: <code>{status['cache_enabled']}</code>\n"
+        f"Cache items: <code>{status['cache_items']}</code>\n"
+        f"Chat model: <code>{escape(status['chat_model'])}</code>\n"
+        f"Embedding model: <code>{escape(status['embedding_model'])}</code>\n"
+        f"TOP_K: <code>{status['top_k']}</code>\n"
+        f"MIN_RELEVANCE_SCORE: <code>{status['min_relevance_score']}</code>"
+    )
+
+    await message.answer(text)
+
+
+async def cmd_reload(message: Message) -> None:
+    global rag_engine
+
+    if not await ensure_admin(message):
+        return
+
+    await message.answer("🔄 Перезагружаю RAG-индекс...")
+
+    try:
+        if rag_engine is None:
+            rag_engine = RAGEngine()
+        else:
+            rag_engine.reload()
+
+        status = rag_engine.get_status()
+
+        await message.answer(
+            "✅ RAG-индекс успешно перезагружен.\n\n"
+            f"Chunks: <code>{status['chunks_count']}</code>\n"
+            f"Embeddings shape: <code>{status['embeddings_shape']}</code>\n"
+            f"KB hash: <code>{status['knowledge_base_hash'][:12]}</code>"
+        )
+    except Exception as exc:
+        logger.exception("Ошибка при reload RAG")
+        rag_engine = None
+
+        await message.answer(
+            "❌ Не удалось перезагрузить RAG-индекс.\n\n"
+            f"Ошибка: <code>{escape(str(exc))}</code>\n\n"
+            "Проверьте файлы:\n"
+            f"{expected_paths_text()}"
+        )
+
+
+async def cmd_clear_cache(message: Message) -> None:
+    global rag_engine
+
+    if not await ensure_admin(message):
+        return
+
+    if rag_engine is not None:
+        deleted_count = rag_engine.clear_cache()
+
+        await message.answer(
+            "✅ Кэш очищен.\n\n"
+            f"Удалено записей: <code>{deleted_count}</code>"
+        )
+        return
+
+    storage_dir = Path(settings.storage_dir)
+    cache_file = os.getenv("CACHE_FILE", "answer_cache.json")
+    cache_path = storage_dir / cache_file
+
+    if cache_path.exists():
+        cache_path.unlink()
+        await message.answer(
+            "✅ Файл кэша удалён.\n\n"
+            f"Путь: <code>{escape(str(cache_path))}</code>"
+        )
+    else:
+        await message.answer(
+            "Кэш не найден.\n\n"
+            f"Путь: <code>{escape(str(cache_path))}</code>"
+        )
+
+
+async def cmd_version(message: Message) -> None:
+    global rag_engine
+
+    if not await ensure_admin(message):
+        return
+
+    if rag_engine is None:
+        await message.answer(
+            "⚠️ RAG-индекс не загружен. Версия базы недоступна.\n\n"
+            f"{expected_paths_text()}"
+        )
+        return
+
+    await message.answer(rag_engine.get_version_text())
+
+
+async def cmd_debug_search(message: Message) -> None:
+    global rag_engine
+
+    if not await ensure_admin(message):
+        return
+
+    query = get_command_arg(message)
+
+    if not query:
+        await message.answer(
+            "Укажите запрос.\n\n"
+            "Пример:\n"
+            "<code>/debug_search слоган</code>"
+        )
+        return
+
+    if rag_engine is None:
+        await message.answer("⚠️ RAG-индекс не загружен.")
+        return
+
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        hits = await rag_engine.debug_search(query)
+    except Exception as exc:
+        logger.exception("Ошибка debug_search")
+        await message.answer(f"❌ Ошибка поиска: <code>{escape(str(exc))}</code>")
+        return
+
+    if not hits:
+        await message.answer(
+            "Ничего не найдено.\n\n"
+            f"Запрос: <code>{escape(query)}</code>"
+        )
+        return
+
+    lines = [
+        "🔎 Debug search",
+        "",
+        f"Запрос: <code>{escape(query)}</code>",
+        f"Найдено chunks: <code>{len(hits)}</code>",
+        "",
+    ]
+
+    for index, hit in enumerate(hits, start=1):
+        search_types = hit.get("search_types", {hit.get("search_type", "unknown")})
+
+        if isinstance(search_types, set):
+            search_types_text = ", ".join(sorted(search_types))
+        elif isinstance(search_types, list):
+            search_types_text = ", ".join(search_types)
+        else:
+            search_types_text = str(search_types)
+
+        preview = hit.get("text", "")
+        preview = preview.replace("\n", " ")
+        preview = preview[:700]
+
+        lines.append(
+            f"{index}. <b>{escape(hit['file_name'])}</b>, стр. <code>{hit['page']}</code>\n"
+            f"chunk_no: <code>{hit['chunk_no']}</code>\n"
+            f"score: <code>{round(float(hit.get('score', 0)), 4)}</code>\n"
+            f"rank_score: <code>{round(float(hit.get('rank_score', 0)), 4)}</code>\n"
+            f"search: <code>{escape(search_types_text)}</code>\n"
+            f"preview: {escape(preview)}\n"
+        )
+
+    full_text = "\n".join(lines)
+
+    for part in split_for_telegram(full_text):
+        await message.answer(part)
 
 
 async def cmd_users(message: Message) -> None:
@@ -525,7 +739,14 @@ async def main() -> None:
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
 
-    # Админ-команды
+    # Админ-команды эксплуатации RAG
+    dp.message.register(cmd_status, Command("status"))
+    dp.message.register(cmd_reload, Command("reload"))
+    dp.message.register(cmd_clear_cache, Command("clear_cache"))
+    dp.message.register(cmd_version, Command("version"))
+    dp.message.register(cmd_debug_search, Command("debug_search"))
+
+    # Админ-команды авторизации
     dp.message.register(cmd_users, Command("users"))
     dp.message.register(cmd_pending, Command("pending"))
     dp.message.register(cmd_allow, Command("allow"))

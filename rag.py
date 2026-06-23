@@ -93,6 +93,7 @@ def normalize_text_for_search(text: str) -> str:
 def tokenize(text: str) -> list[str]:
     text = normalize_text_for_search(text)
     tokens = re.findall(r"[a-zа-я0-9]+", text, flags=re.IGNORECASE)
+
     return [
         token
         for token in tokens
@@ -108,15 +109,34 @@ class RAGEngine:
         self.index_path = self.storage_dir / INDEX_FILE
         self.chunks_path = self.storage_dir / CHUNKS_FILE
 
+        self.embeddings: np.ndarray
+        self.chunks: list[dict]
+        self.knowledge_base_hash: str
+        self.keyword_index: list[dict]
+        self.cache: AnswerCache
+
+        self.reload()
+
+    def reload(self) -> None:
+        """
+        Полностью перезагружает базу знаний из index.npz и chunks.json.
+        Используется командой /reload.
+        """
         self.embeddings = self._load_embeddings()
         self.chunks = self._load_chunks()
-
         self.knowledge_base_hash = file_sha256(self.chunks_path)
-
         self.keyword_index = self._build_keyword_index()
+
         self.cache = AnswerCache(
             storage_dir=self.storage_dir,
             knowledge_base_hash=self.knowledge_base_hash,
+        )
+
+        logger.info(
+            "RAG reloaded. chunks=%s, embeddings_shape=%s, kb_hash=%s",
+            len(self.chunks),
+            self.embeddings.shape,
+            self.knowledge_base_hash[:12],
         )
 
     def _load_embeddings(self) -> np.ndarray:
@@ -144,7 +164,6 @@ class RAGEngine:
 
         for chunk in self.chunks:
             text = chunk.get("text", "")
-            normalized_text = normalize_text_for_search(text)
             tokens = tokenize(text)
 
             index.append(
@@ -154,7 +173,7 @@ class RAGEngine:
                     "page": chunk["page"],
                     "chunk_no": chunk["chunk_no"],
                     "text": text,
-                    "normalized_text": normalized_text,
+                    "normalized_text": normalize_text_for_search(text),
                     "token_counts": Counter(tokens),
                     "token_set": set(tokens),
                 }
@@ -171,13 +190,8 @@ class RAGEngine:
         vector = np.array([response.data[0].embedding], dtype=np.float32)
         return normalize_vectors(vector)[0]
 
-    async def vector_search(
-        self,
-        question: str,
-        question_vector: np.ndarray,
-    ) -> list[dict]:
+    async def vector_search(self, question_vector: np.ndarray) -> list[dict]:
         scores = self.embeddings @ question_vector
-
         top_indices = np.argsort(scores)[::-1][: settings.top_k]
 
         results: list[dict] = []
@@ -214,6 +228,21 @@ class RAGEngine:
 
         results: list[dict] = []
 
+        important_fields = {
+            "слоган",
+            "состав",
+            "противопоказания",
+            "показания",
+            "дозировка",
+            "применение",
+            "рекомендации",
+            "сообщение",
+            "форма",
+            "выпуска",
+            "описание",
+            "имидж",
+        }
+
         for item in self.keyword_index:
             score = 0.0
 
@@ -226,6 +255,7 @@ class RAGEngine:
 
             for token in query_tokens:
                 count = token_counts.get(token, 0)
+
                 if count:
                     score += count * 3.0
 
@@ -236,27 +266,11 @@ class RAGEngine:
                 if f"{token}:" in text:
                     score += 15.0
 
-            important_fields = {
-                "слоган",
-                "состав",
-                "противопоказания",
-                "показания",
-                "дозировка",
-                "применение",
-                "рекомендации",
-                "сообщение",
-                "форма",
-                "выпуска",
-                "описание",
-                "имидж",
-            }
-
             matched_important_fields = important_fields.intersection(query_tokens)
 
-            if matched_important_fields:
-                for field in matched_important_fields:
-                    if field in token_set:
-                        score += 10.0
+            for field in matched_important_fields:
+                if field in token_set:
+                    score += 10.0
 
             if score > 0:
                 results.append(
@@ -281,11 +295,7 @@ class RAGEngine:
         question: str,
         question_vector: np.ndarray,
     ) -> list[dict]:
-        vector_results = await self.vector_search(
-            question=question,
-            question_vector=question_vector,
-        )
-
+        vector_results = await self.vector_search(question_vector)
         keyword_results = self.keyword_search(question)
 
         combined: dict[int, dict] = {}
@@ -320,26 +330,19 @@ class RAGEngine:
 
         return final_results[: settings.top_k]
 
+    async def debug_search(self, question: str) -> list[dict]:
+        """
+        Поиск chunks без генерации ответа.
+        Используется командой /debug_search.
+        """
+        question_vector = await self._embed_query(question)
+        return await self.search(question=question, question_vector=question_vector)
+
     async def answer(self, question: str) -> str:
-        """
-        Главная функция ответа.
-
-        Порядок:
-        1. Точный поиск в кэше
-        2. Embedding вопроса
-        3. Семантический поиск в кэше
-        4. RAG-поиск по базе
-        5. Генерация ответа
-        6. Сохранение ответа в кэш
-        """
-
         exact_cache_hit = self.cache.find_exact(question)
 
         if exact_cache_hit:
-            logger.info(
-                "Ответ найден в exact cache. Question: %s",
-                exact_cache_hit.question,
-            )
+            logger.info("Ответ найден в exact cache")
             return exact_cache_hit.answer
 
         question_vector = await self._embed_query(question)
@@ -351,9 +354,8 @@ class RAGEngine:
 
         if semantic_cache_hit:
             logger.info(
-                "Ответ найден в semantic cache. Similarity: %.3f. Cached question: %s",
+                "Ответ найден в semantic cache. Similarity: %.3f",
                 semantic_cache_hit.similarity,
-                semantic_cache_hit.question,
             )
             return semantic_cache_hit.answer
 
@@ -417,3 +419,46 @@ QUESTION:
         )
 
         return final_answer
+
+    def clear_cache(self) -> int:
+        """
+        Очищает кэш ответов.
+        """
+        return self.cache.clear()
+
+    def get_status(self) -> dict:
+        """
+        Возвращает технический статус RAG.
+        """
+        return {
+            "storage_dir": str(self.storage_dir),
+            "index_path": str(self.index_path),
+            "chunks_path": str(self.chunks_path),
+            "index_exists": self.index_path.exists(),
+            "chunks_exists": self.chunks_path.exists(),
+            "chunks_count": len(self.chunks),
+            "embeddings_shape": tuple(self.embeddings.shape),
+            "knowledge_base_hash": self.knowledge_base_hash,
+            "cache_enabled": self.cache.enabled,
+            "cache_path": str(self.cache.cache_path),
+            "cache_items": self.cache.size(),
+            "chat_model": settings.chat_model,
+            "embedding_model": settings.embedding_model,
+            "top_k": settings.top_k,
+            "min_relevance_score": settings.min_relevance_score,
+        }
+
+    def get_version_text(self) -> str:
+        """
+        Короткая информация о версии базы знаний.
+        """
+        status = self.get_status()
+
+        return (
+            "📦 Версия базы знаний\n\n"
+            f"Hash: <code>{status['knowledge_base_hash']}</code>\n"
+            f"Short hash: <code>{status['knowledge_base_hash'][:12]}</code>\n"
+            f"Chunks: <code>{status['chunks_count']}</code>\n"
+            f"Embeddings shape: <code>{status['embeddings_shape']}</code>\n"
+            f"Embedding model: <code>{status['embedding_model']}</code>"
+        )

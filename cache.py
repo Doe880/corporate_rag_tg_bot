@@ -41,8 +41,10 @@ def vector_to_list(vector: np.ndarray) -> list[float]:
 def list_to_vector(values: list[float]) -> np.ndarray:
     vector = np.array(values, dtype=np.float32)
     norm = np.linalg.norm(vector)
+
     if norm == 0:
         return vector
+
     return vector / norm
 
 
@@ -58,21 +60,10 @@ class AnswerCache:
     """
     Кэш ответов.
 
-    Хранит:
-    - исходный вопрос
-    - нормализованный вопрос
-    - embedding вопроса
-    - готовый ответ
-    - hash базы знаний
-
-    Если база знаний изменилась, старый кэш автоматически не используется.
+    Если chunks.json изменился, старый кэш автоматически не используется.
     """
 
-    def __init__(
-        self,
-        storage_dir: str | Path,
-        knowledge_base_hash: str,
-    ) -> None:
+    def __init__(self, storage_dir: str | Path, knowledge_base_hash: str) -> None:
         self.enabled = str_to_bool(os.getenv("CACHE_ENABLED"), default=True)
         self.similarity_threshold = float(
             os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.92")
@@ -103,7 +94,6 @@ class AnswerCache:
             return
 
         if data.get("knowledge_base_hash") != self.knowledge_base_hash:
-            # База знаний изменилась — старый кэш использовать нельзя.
             self.items = []
             return
 
@@ -127,10 +117,6 @@ class AnswerCache:
         temp_path.replace(self.cache_path)
 
     def find_exact(self, question: str) -> CacheHit | None:
-        """
-        Точный поиск по нормализованному вопросу.
-        Не требует embedding, поэтому самый дешёвый.
-        """
         if not self.enabled:
             return None
 
@@ -152,10 +138,6 @@ class AnswerCache:
         question: str,
         question_vector: np.ndarray,
     ) -> CacheHit | None:
-        """
-        Семантический поиск по похожим вопросам.
-        Требует embedding вопроса, но экономит chat completion.
-        """
         if not self.enabled or not self.items:
             return None
 
@@ -191,11 +173,6 @@ class AnswerCache:
         question_vector: np.ndarray,
         answer: str,
     ) -> None:
-        """
-        Сохраняет ответ в кэш.
-        Негативные ответы не кэшируем, чтобы случайная ошибка поиска
-        не закрепилась в кэше.
-        """
         if not self.enabled:
             return
 
@@ -209,7 +186,6 @@ class AnswerCache:
 
         normalized = normalize_question(question)
 
-        # Если такой вопрос уже есть — обновим ответ.
         for item in self.items:
             if item.get("normalized_question") == normalized:
                 item["answer"] = clean_answer
@@ -230,6 +206,22 @@ class AnswerCache:
         )
 
         self._save()
+
+    def clear(self) -> int:
+        """
+        Очищает кэш в памяти и удаляет файл answer_cache.json.
+        Возвращает количество удалённых записей.
+        """
+        count = len(self.items)
+        self.items = []
+
+        if self.cache_path.exists():
+            self.cache_path.unlink()
+
+        return count
+
+    def size(self) -> int:
+        return len(self.items)
 
 
 def file_sha256(path: Path) -> str:
