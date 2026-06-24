@@ -2,66 +2,43 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from config import settings
+from db import get_connection, init_db
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def row_to_dict(row: Any) -> dict[str, Any] | None:
+    if row is None:
+        return None
+
+    return dict(row)
+
+
 class AuthStore:
     """
-    Хранилище авторизованных пользователей.
+    Авторизация через SQLite.
 
     Админы берутся из ADMIN_USER_IDS.
-    Обычные пользователи хранятся в AUTH_USERS_FILE.
+    Обычные пользователи и заявки хранятся в SQLite.
 
     На Amvera:
-    AUTH_USERS_FILE=/data/auth_users.json
+    DB_PATH=/data/bot.db
     """
 
     def __init__(self) -> None:
-        self.path = Path(settings.auth_users_file)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.data = self._load()
-
-    def _empty_data(self) -> dict[str, Any]:
-        return {
-            "users": {},
-            "pending": {},
-        }
-
-    def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return self._empty_data()
-
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return self._empty_data()
-
-        if "users" not in data:
-            data["users"] = {}
-
-        if "pending" not in data:
-            data["pending"] = {}
-
-        return data
-
-    def _save(self) -> None:
-        temp_path = self.path.with_suffix(".tmp")
-
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-
-        temp_path.replace(self.path)
+        init_db()
 
     def reload(self) -> None:
-        self.data = self._load()
+        """
+        Оставлено для совместимости.
+        Для SQLite отдельная перезагрузка не нужна.
+        """
+        init_db()
 
     def is_admin(self, user_id: int | None) -> bool:
         if user_id is None:
@@ -85,7 +62,18 @@ class AuthStore:
         if self.is_static_allowed(user_id):
             return True
 
-        return str(user_id) in self.data["users"]
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE user_id = ?
+                  AND status = 'active'
+                """,
+                (user_id,),
+            ).fetchone()
+
+        return row is not None
 
     def add_pending(
         self,
@@ -94,72 +82,208 @@ class AuthStore:
         full_name: str | None,
     ) -> bool:
         """
-        Добавляет заявку.
+        Добавляет заявку на доступ.
 
         Возвращает True, если заявка новая.
-        Возвращает False, если заявка уже была.
+        Возвращает False, если pending-заявка уже была.
         """
         if self.is_allowed(user_id):
             return False
 
-        key = str(user_id)
-        is_new = key not in self.data["pending"]
+        now = now_str()
 
-        old_requested_at = self.data["pending"].get(key, {}).get("requested_at")
+        with get_connection() as conn:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM access_requests
+                WHERE user_id = ?
+                  AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
 
-        self.data["pending"][key] = {
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE access_requests
+                    SET username = ?,
+                        full_name = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (username, full_name, now, existing["id"]),
+                )
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO access_requests (
+                    user_id,
+                    username,
+                    full_name,
+                    status,
+                    requested_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (user_id, username, full_name, now, now),
+            )
+
+        return True
+
+    def get_pending(self, user_id: int) -> dict[str, Any] | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    full_name,
+                    requested_at,
+                    updated_at
+                FROM access_requests
+                WHERE user_id = ?
+                  AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+
+        return row_to_dict(row)
+
+    def list_pending(self) -> list[dict[str, Any]]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    full_name,
+                    requested_at,
+                    updated_at
+                FROM access_requests
+                WHERE status = 'pending'
+                ORDER BY requested_at ASC
+                """
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def approve_user(self, user_id: int, admin_id: int) -> dict[str, Any]:
+        now = now_str()
+        pending = self.get_pending(user_id)
+
+        username = pending.get("username") if pending else None
+        full_name = pending.get("full_name") if pending else None
+        requested_at = pending.get("requested_at") if pending else None
+
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    user_id,
+                    username,
+                    full_name,
+                    status,
+                    source,
+                    approved_by,
+                    approved_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 'active', 'admin_approval', ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    full_name = excluded.full_name,
+                    status = 'active',
+                    source = 'admin_approval',
+                    approved_by = excluded.approved_by,
+                    approved_at = excluded.approved_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    username,
+                    full_name,
+                    admin_id,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+            conn.execute(
+                """
+                UPDATE access_requests
+                SET status = 'approved',
+                    decided_by = ?,
+                    decided_at = ?,
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND status = 'pending'
+                """,
+                (admin_id, now, now, user_id),
+            )
+
+            self._log_admin_action(
+                conn=conn,
+                admin_id=admin_id,
+                action="approve_user",
+                target_user_id=user_id,
+                details={
+                    "username": username,
+                    "full_name": full_name,
+                },
+            )
+
+        return {
             "user_id": user_id,
             "username": username,
             "full_name": full_name,
-            "requested_at": old_requested_at or now_str(),
-            "updated_at": now_str(),
+            "requested_at": requested_at,
+            "approved_by": admin_id,
+            "approved_at": now,
+            "status": "approved",
         }
 
-        self._save()
-
-        return is_new
-
-    def get_pending(self, user_id: int) -> dict[str, Any] | None:
-        return self.data["pending"].get(str(user_id))
-
-    def list_pending(self) -> list[dict[str, Any]]:
-        items = list(self.data["pending"].values())
-        return sorted(items, key=lambda x: x.get("requested_at", ""))
-
-    def approve_user(self, user_id: int, admin_id: int) -> dict[str, Any]:
-        key = str(user_id)
-
-        record = self.data["pending"].pop(
-            key,
-            {
-                "user_id": user_id,
-                "username": None,
-                "full_name": None,
-                "requested_at": None,
-            },
-        )
-
-        record["approved_by"] = admin_id
-        record["approved_at"] = now_str()
-        record["status"] = "approved"
-
-        self.data["users"][key] = record
-        self._save()
-
-        return record
-
     def deny_user(self, user_id: int, admin_id: int) -> dict[str, Any] | None:
-        key = str(user_id)
+        now = now_str()
+        pending = self.get_pending(user_id)
 
-        record = self.data["pending"].pop(key, None)
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE access_requests
+                SET status = 'denied',
+                    decided_by = ?,
+                    decided_at = ?,
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND status = 'pending'
+                """,
+                (admin_id, now, now, user_id),
+            )
 
-        if record:
-            record["denied_by"] = admin_id
-            record["denied_at"] = now_str()
+            self._log_admin_action(
+                conn=conn,
+                admin_id=admin_id,
+                action="deny_user",
+                target_user_id=user_id,
+                details=pending or {},
+            )
 
-        self._save()
+        if not pending:
+            return None
 
-        return record
+        pending["denied_by"] = admin_id
+        pending["denied_at"] = now
+
+        return pending
 
     def allow_user(
         self,
@@ -168,23 +292,76 @@ class AuthStore:
         username: str | None = None,
         full_name: str | None = None,
     ) -> dict[str, Any]:
-        key = str(user_id)
+        now = now_str()
 
-        record = {
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    user_id,
+                    username,
+                    full_name,
+                    status,
+                    source,
+                    approved_by,
+                    approved_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 'active', 'manual_admin_command', ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    full_name = excluded.full_name,
+                    status = 'active',
+                    source = 'manual_admin_command',
+                    approved_by = excluded.approved_by,
+                    approved_at = excluded.approved_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    username,
+                    full_name,
+                    admin_id,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+            conn.execute(
+                """
+                UPDATE access_requests
+                SET status = 'approved',
+                    decided_by = ?,
+                    decided_at = ?,
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND status = 'pending'
+                """,
+                (admin_id, now, now, user_id),
+            )
+
+            self._log_admin_action(
+                conn=conn,
+                admin_id=admin_id,
+                action="allow_user",
+                target_user_id=user_id,
+                details={
+                    "username": username,
+                    "full_name": full_name,
+                },
+            )
+
+        return {
             "user_id": user_id,
             "username": username,
             "full_name": full_name,
             "approved_by": admin_id,
-            "approved_at": now_str(),
+            "approved_at": now,
             "status": "approved",
             "source": "manual_admin_command",
         }
-
-        self.data["pending"].pop(key, None)
-        self.data["users"][key] = record
-        self._save()
-
-        return record
 
     def revoke_user(self, user_id: int) -> tuple[bool, str]:
         """
@@ -210,18 +387,110 @@ class AuthStore:
                 "Удалите его из переменных Amvera и перезапустите контейнер.",
             )
 
-        key = str(user_id)
+        now = now_str()
 
-        removed_user = self.data["users"].pop(key, None)
-        removed_pending = self.data["pending"].pop(key, None)
+        with get_connection() as conn:
+            user_row = conn.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE user_id = ?
+                  AND status = 'active'
+                """,
+                (user_id,),
+            ).fetchone()
 
-        if removed_user is None and removed_pending is None:
-            return False, "Пользователь не найден в списке доступа или заявок."
+            pending_row = conn.execute(
+                """
+                SELECT id
+                FROM access_requests
+                WHERE user_id = ?
+                  AND status = 'pending'
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
 
-        self._save()
+            if not user_row and not pending_row:
+                return False, "Пользователь не найден в списке доступа или заявок."
+
+            conn.execute(
+                """
+                UPDATE users
+                SET status = 'revoked',
+                    updated_at = ?
+                WHERE user_id = ?
+                """,
+                (now, user_id),
+            )
+
+            conn.execute(
+                """
+                UPDATE access_requests
+                SET status = 'revoked',
+                    updated_at = ?,
+                    decided_at = ?
+                WHERE user_id = ?
+                  AND status = 'pending'
+                """,
+                (now, now, user_id),
+            )
+
+            self._log_admin_action(
+                conn=conn,
+                admin_id=None,
+                action="revoke_user",
+                target_user_id=user_id,
+                details={},
+            )
 
         return True, "Пользователь удалён."
 
     def list_users(self) -> list[dict[str, Any]]:
-        items = list(self.data["users"].values())
-        return sorted(items, key=lambda x: x.get("approved_at", ""))
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    full_name,
+                    source,
+                    approved_by,
+                    approved_at,
+                    created_at,
+                    updated_at
+                FROM users
+                WHERE status = 'active'
+                ORDER BY approved_at ASC, created_at ASC
+                """
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def _log_admin_action(
+        self,
+        conn,
+        admin_id: int | None,
+        action: str,
+        target_user_id: int | None,
+        details: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO admin_actions (
+                created_at,
+                admin_id,
+                action,
+                target_user_id,
+                details
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                now_str(),
+                admin_id,
+                action,
+                target_user_id,
+                json.dumps(details, ensure_ascii=False),
+            ),
+        )

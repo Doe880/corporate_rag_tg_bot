@@ -9,8 +9,10 @@ load_dotenv()
 
 def _get_required(name: str) -> str:
     value = os.getenv(name)
+
     if not value:
         raise RuntimeError(f"Не задана переменная окружения {name}. Проверьте файл .env")
+
     return value
 
 
@@ -25,6 +27,12 @@ def _get_float(name: str, default: float) -> float:
 
 
 def _get_int_set(name: str) -> set[int]:
+    """
+    Читает список Telegram user_id из переменной окружения.
+
+    Пример:
+    ADMIN_USER_IDS=123456789,987654321
+    """
     raw = os.getenv(name, "").strip()
 
     if not raw:
@@ -55,7 +63,8 @@ class Settings:
 
     admin_user_ids: set[int]
     allowed_user_ids: set[int]
-    auth_users_file: str
+
+    db_path: str
 
     openai_api_key: str
     chat_model: str
@@ -63,7 +72,6 @@ class Settings:
 
     private_docs_dir: str
     storage_dir: str
-    logs_dir: str
 
     chunk_size_tokens: int
     chunk_overlap_tokens: int
@@ -79,10 +87,8 @@ settings = Settings(
 
     admin_user_ids=_get_int_set("ADMIN_USER_IDS"),
     allowed_user_ids=_get_int_set("ALLOWED_USER_IDS"),
-    auth_users_file=os.getenv(
-        "AUTH_USERS_FILE",
-        str(Path(storage_dir) / "auth_users.json"),
-    ),
+
+    db_path=os.getenv("DB_PATH", str(Path(storage_dir) / "bot.db")),
 
     openai_api_key=_get_required("OPENAI_API_KEY"),
     chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
@@ -90,7 +96,6 @@ settings = Settings(
 
     private_docs_dir=os.getenv("PRIVATE_DOCS_DIR", "private_docs"),
     storage_dir=storage_dir,
-    logs_dir=os.getenv("LOGS_DIR", str(Path(storage_dir) / "logs")),
 
     chunk_size_tokens=_get_int("CHUNK_SIZE_TOKENS", 350),
     chunk_overlap_tokens=_get_int("CHUNK_OVERLAP_TOKENS", 70),

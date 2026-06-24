@@ -5,10 +5,10 @@ import re
 import uuid
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from config import settings
+from db import get_connection, init_db
 
 
 def now_str() -> str:
@@ -22,48 +22,57 @@ def normalize_query(text: str) -> str:
     return text.strip()
 
 
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def json_loads_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(data, list):
+        return [str(item) for item in data]
+
+    return []
+
+
 class AnalyticsStore:
     """
-    Хранилище логов запросов и оценок.
+    Хранилище логов запросов и оценок в SQLite.
 
-    На Amvera рекомендуется:
-    LOGS_DIR=/data/logs
-
-    Файлы:
-    /data/logs/query_log.jsonl
-    /data/logs/feedback_log.jsonl
+    На Amvera:
+    DB_PATH=/data/bot.db
     """
 
     def __init__(self) -> None:
-        self.logs_dir = Path(settings.logs_dir)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        init_db()
 
-        self.query_log_path = self.logs_dir / "query_log.jsonl"
-        self.feedback_log_path = self.logs_dir / "feedback_log.jsonl"
+    def _make_answer_id(self) -> str:
+        """
+        Генерирует короткий answer_id и проверяет уникальность.
+        """
+        for _ in range(5):
+            answer_id = uuid.uuid4().hex[:12]
 
-    def _append_jsonl(self, path: Path, record: dict[str, Any]) -> None:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with get_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT answer_id
+                    FROM query_logs
+                    WHERE answer_id = ?
+                    """,
+                    (answer_id,),
+                ).fetchone()
 
-    def _read_jsonl(self, path: Path) -> list[dict[str, Any]]:
-        if not path.exists():
-            return []
+            if row is None:
+                return answer_id
 
-        records: list[dict[str, Any]] = []
-
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-        return records
+        return uuid.uuid4().hex
 
     def log_query(
         self,
@@ -78,32 +87,66 @@ class AnalyticsStore:
         Логирует каждый запрос пользователя.
         Возвращает answer_id, который потом используется в кнопках feedback.
         """
-        answer_id = uuid.uuid4().hex[:12]
+        answer_id = self._make_answer_id()
 
-        record = {
-            "answer_id": answer_id,
-            "created_at": now_str(),
-            "user_id": user_id,
-            "username": username,
-            "full_name": full_name,
-            "question": question,
-            "normalized_question": normalize_query(question),
-            "answer": answer,
-            "sources": sources,
-        }
-
-        self._append_jsonl(self.query_log_path, record)
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO query_logs (
+                    answer_id,
+                    created_at,
+                    user_id,
+                    username,
+                    full_name,
+                    question,
+                    normalized_question,
+                    answer,
+                    sources_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    answer_id,
+                    now_str(),
+                    user_id,
+                    username,
+                    full_name,
+                    question,
+                    normalize_query(question),
+                    answer,
+                    json_dumps(sources),
+                ),
+            )
 
         return answer_id
 
     def get_query_by_answer_id(self, answer_id: str) -> dict[str, Any] | None:
-        records = self._read_jsonl(self.query_log_path)
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    answer_id,
+                    created_at,
+                    user_id,
+                    username,
+                    full_name,
+                    question,
+                    normalized_question,
+                    answer,
+                    sources_json
+                FROM query_logs
+                WHERE answer_id = ?
+                """,
+                (answer_id,),
+            ).fetchone()
 
-        for record in reversed(records):
-            if record.get("answer_id") == answer_id:
-                return record
+        if not row:
+            return None
 
-        return None
+        record = dict(row)
+        record["sources"] = json_loads_list(record.pop("sources_json", None))
+
+        return record
 
     def log_feedback(
         self,
@@ -127,83 +170,162 @@ class AnalyticsStore:
             "feedback": feedback,
             "feedback_user_id": feedback_user_id,
 
-            # сохраняем данные, чтобы потом видеть, где ошибка
             "question": query_record.get("question"),
             "answer": query_record.get("answer"),
-            "sources": query_record.get("sources"),
+            "sources": query_record.get("sources") or [],
+
             "original_user_id": query_record.get("user_id"),
             "original_username": query_record.get("username"),
             "original_full_name": query_record.get("full_name"),
             "original_created_at": query_record.get("created_at"),
         }
 
-        self._append_jsonl(self.feedback_log_path, feedback_record)
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO feedback_logs (
+                    created_at,
+                    answer_id,
+                    feedback,
+                    feedback_user_id,
+                    question,
+                    answer,
+                    sources_json,
+                    original_user_id,
+                    original_username,
+                    original_full_name,
+                    original_created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback_record["created_at"],
+                    feedback_record["answer_id"],
+                    feedback_record["feedback"],
+                    feedback_record["feedback_user_id"],
+                    feedback_record["question"],
+                    feedback_record["answer"],
+                    json_dumps(feedback_record["sources"]),
+                    feedback_record["original_user_id"],
+                    feedback_record["original_username"],
+                    feedback_record["original_full_name"],
+                    feedback_record["original_created_at"],
+                ),
+            )
 
         return True, feedback_record
 
     def get_stats(self) -> dict[str, Any]:
-        queries = self._read_jsonl(self.query_log_path)
-        feedback = self._read_jsonl(self.feedback_log_path)
+        with get_connection() as conn:
+            total_queries = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM query_logs
+                """
+            ).fetchone()["count"]
 
-        unique_users = {
-            item.get("user_id")
-            for item in queries
-            if item.get("user_id") is not None
-        }
+            unique_users = conn.execute(
+                """
+                SELECT COUNT(DISTINCT user_id) AS count
+                FROM query_logs
+                WHERE user_id IS NOT NULL
+                """
+            ).fetchone()["count"]
 
-        feedback_counter = Counter(
-            item.get("feedback")
-            for item in feedback
-        )
+            total_feedback = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM feedback_logs
+                """
+            ).fetchone()["count"]
+
+            feedback_rows = conn.execute(
+                """
+                SELECT feedback, COUNT(*) AS count
+                FROM feedback_logs
+                GROUP BY feedback
+                """
+            ).fetchall()
+
+        feedback_counter = Counter()
+
+        for row in feedback_rows:
+            feedback_counter[row["feedback"]] = row["count"]
+
+        db_label = f"sqlite:{settings.db_path}"
 
         return {
-            "total_queries": len(queries),
-            "unique_users": len(unique_users),
-            "total_feedback": len(feedback),
+            "total_queries": total_queries,
+            "unique_users": unique_users,
+            "total_feedback": total_feedback,
             "good_feedback": feedback_counter.get("good", 0),
             "bad_feedback": feedback_counter.get("bad", 0),
-            "query_log_path": str(self.query_log_path),
-            "feedback_log_path": str(self.feedback_log_path),
+
+            # Оставляем эти ключи для совместимости с текущим bot.py
+            "query_log_path": f"{db_label}#query_logs",
+            "feedback_log_path": f"{db_label}#feedback_logs",
         }
 
     def get_popular_queries(self, limit: int = 10) -> list[dict[str, Any]]:
-        queries = self._read_jsonl(self.query_log_path)
-
-        counter: Counter[str] = Counter()
-        examples: dict[str, str] = {}
-
-        for item in queries:
-            normalized = item.get("normalized_question")
-            original = item.get("question")
-
-            if not normalized:
-                continue
-
-            counter[normalized] += 1
-
-            if normalized not in examples and original:
-                examples[normalized] = original
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    normalized_question,
+                    MIN(question) AS question,
+                    COUNT(*) AS count
+                FROM query_logs
+                WHERE normalized_question IS NOT NULL
+                  AND normalized_question != ''
+                GROUP BY normalized_question
+                ORDER BY count DESC, normalized_question ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
 
         result: list[dict[str, Any]] = []
 
-        for normalized, count in counter.most_common(limit):
+        for row in rows:
             result.append(
                 {
-                    "question": examples.get(normalized, normalized),
-                    "normalized_question": normalized,
-                    "count": count,
+                    "question": row["question"],
+                    "normalized_question": row["normalized_question"],
+                    "count": row["count"],
                 }
             )
 
         return result
 
     def get_recent_bad_feedback(self, limit: int = 10) -> list[dict[str, Any]]:
-        feedback = self._read_jsonl(self.feedback_log_path)
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    created_at,
+                    answer_id,
+                    feedback,
+                    feedback_user_id,
+                    question,
+                    answer,
+                    sources_json,
+                    original_user_id,
+                    original_username,
+                    original_full_name,
+                    original_created_at
+                FROM feedback_logs
+                WHERE feedback = 'bad'
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
 
-        bad_items = [
-            item
-            for item in feedback
-            if item.get("feedback") == "bad"
-        ]
+        result: list[dict[str, Any]] = []
 
-        return list(reversed(bad_items))[:limit]
+        for row in rows:
+            item = dict(row)
+            item["sources"] = json_loads_list(item.pop("sources_json", None))
+            result.append(item)
+
+        return result
