@@ -31,86 +31,25 @@ SYSTEM_PROMPT = """
 
 
 STOPWORDS = {
-    "что",
-    "это",
-    "как",
-    "какой",
-    "какая",
-    "какие",
-    "какое",
-    "где",
-    "когда",
-    "зачем",
-    "почему",
-    "для",
-    "про",
-    "при",
-    "или",
-    "и",
-    "а",
-    "в",
-    "во",
-    "на",
-    "с",
-    "со",
-    "по",
-    "из",
-    "у",
-    "от",
-    "до",
-    "за",
-    "под",
-    "над",
-    "об",
-    "обо",
-    "без",
-    "есть",
-    "ли",
-    "же",
-    "бы",
-    "мне",
-    "найди",
-    "расскажи",
-    "напиши",
-    "покажи",
-    "информация",
-    "информацию",
-    "база",
-    "базе",
-    "знаний",
+    "что", "это", "как", "какой", "какая", "какие", "какое",
+    "где", "когда", "зачем", "почему", "для", "про", "при",
+    "или", "и", "а", "в", "во", "на", "с", "со", "по", "из",
+    "у", "от", "до", "за", "под", "над", "об", "обо", "без",
+    "есть", "ли", "же", "бы", "мне", "найди", "расскажи",
+    "напиши", "покажи", "информация", "информацию", "база",
+    "базе", "знаний",
 }
 
 
 IMPORTANT_FIELDS = {
-    "слоган",
-    "девиз",
-    "состав",
-    "компоненты",
-    "вещество",
-    "вещества",
-    "противопоказания",
-    "показания",
-    "дозировка",
-    "применение",
-    "прием",
-    "принимать",
-    "рекомендации",
-    "сообщение",
-    "форма",
-    "выпуска",
-    "описание",
-    "имидж",
-    "ключевое",
-    "эффективность",
-    "аналоги",
-    "преимущества",
-    "выгода",
+    "слоган", "девиз", "состав", "компоненты", "вещество", "вещества",
+    "противопоказания", "показания", "дозировка", "применение",
+    "прием", "принимать", "рекомендации", "сообщение", "форма",
+    "выпуска", "описание", "имидж", "ключевое", "эффективность",
+    "аналоги", "преимущества", "выгода",
 }
 
 
-# Query expansion:
-# Если пользователь задаёт вопрос другими словами,
-# бот расширяет запрос синонимами и близкими формулировками.
 QUERY_EXPANSIONS = {
     "слоган": [
         "девиз",
@@ -319,16 +258,6 @@ def unique_preserve_order(items: list[str]) -> list[str]:
 
 
 def expand_query_tokens(question: str) -> tuple[list[str], list[str], str]:
-    """
-    Возвращает:
-    1. original_tokens — токены исходного вопроса
-    2. expanded_tokens — исходные токены + расширенные токены
-    3. expanded_text — текст вопроса + расширенные слова
-
-    Пример:
-    вопрос: "девиз продукта"
-    expanded_tokens: ["девиз", "продукта", "слоган", "ключевая", "фраза", ...]
-    """
     original_tokens = tokenize(question)
     expanded_tokens: list[str] = []
 
@@ -360,10 +289,6 @@ def build_query_token_weights(
     original_tokens: list[str],
     expanded_tokens: list[str],
 ) -> dict[str, float]:
-    """
-    Вес исходных токенов выше, вес расширенных токенов ниже.
-    Это нужно, чтобы query expansion помогал, но не перебивал исходный смысл вопроса.
-    """
     weights: dict[str, float] = {}
 
     for token in expanded_tokens:
@@ -406,10 +331,6 @@ class RAGEngine:
         self.reload()
 
     def reload(self) -> None:
-        """
-        Полностью перезагружает базу знаний из index.npz и chunks.json.
-        Используется командой /reload.
-        """
         self.embeddings = self._load_embeddings()
         self.chunks = self._load_chunks()
         self.knowledge_base_hash = file_sha256(self.chunks_path)
@@ -450,14 +371,6 @@ class RAGEngine:
             return json.load(f)
 
     def _build_bm25_index(self) -> tuple[list[dict], dict[str, float], float]:
-        """
-        Строит BM25-индекс по chunks.
-
-        BM25 лучше простого keyword search, потому что учитывает:
-        - частоту слова в chunk
-        - редкость слова во всей базе
-        - длину документа/chunk
-        """
         index: list[dict] = []
         doc_freq: Counter[str] = Counter()
         total_doc_len = 0
@@ -493,7 +406,6 @@ class RAGEngine:
         idf: dict[str, float] = {}
 
         for token, df in doc_freq.items():
-            # Классическая сглаженная формула IDF для BM25.
             idf[token] = math.log(1 + ((docs_count - df + 0.5) / (df + 0.5)))
 
         return index, idf, avg_doc_len
@@ -512,9 +424,6 @@ class RAGEngine:
         question_vector: np.ndarray,
         limit: int,
     ) -> list[dict]:
-        """
-        Semantic/vector search через embeddings.
-        """
         scores = self.embeddings @ question_vector
         top_indices = np.argsort(scores)[::-1][:limit]
 
@@ -551,15 +460,6 @@ class RAGEngine:
         question: str,
         limit: int,
     ) -> list[dict]:
-        """
-        BM25-поиск по chunks с query expansion.
-
-        Исходный вопрос:
-        "девиз продукта"
-
-        Расширенный поиск:
-        "девиз продукта слоган ключевая фраза ключевое сообщение ..."
-        """
         original_tokens, expanded_tokens, expanded_text = expand_query_tokens(question)
         normalized_question = normalize_text_for_search(question)
 
@@ -575,7 +475,6 @@ class RAGEngine:
         expanded_token_set = set(expanded_tokens)
 
         results: list[dict] = []
-
         avg_doc_len = self.bm25_avg_doc_len or 1.0
 
         for item in self.bm25_index:
@@ -584,7 +483,6 @@ class RAGEngine:
             doc_len = item["doc_len"] or 1
             text = item["normalized_text"]
 
-            # Быстрый пропуск: если нет ни одного совпадающего термина.
             if not expanded_token_set.intersection(token_set):
                 continue
 
@@ -605,7 +503,6 @@ class RAGEngine:
 
                 bm25_score += weight * idf * ((tf * (BM25_K1 + 1)) / denominator)
 
-            # Дополнительные бонусы поверх BM25.
             exact_phrase_bonus = 0.0
             field_bonus = 0.0
             all_original_terms_bonus = 0.0
@@ -615,12 +512,10 @@ class RAGEngine:
             if normalized_question and normalized_question in text:
                 exact_phrase_bonus = 5.0
 
-            # Если совпадает поле из исходного вопроса, даём сильный бонус.
             for token in original_tokens:
                 if f"{token}:" in text:
                     field_bonus += 3.0
 
-            # Если совпадает поле из расширенного запроса, даём более слабый бонус.
             for token in expanded_tokens:
                 if token in original_token_set:
                     continue
@@ -637,7 +532,6 @@ class RAGEngine:
                 if field in token_set:
                     important_field_bonus += 2.0
 
-            # Если расширение помогло найти термин, которого не было в исходном запросе.
             expanded_only_tokens = expanded_token_set - original_token_set
 
             if expanded_only_tokens.intersection(token_set):
@@ -681,10 +575,6 @@ class RAGEngine:
         vector_results: list[dict],
         bm25_results: list[dict],
     ) -> list[dict]:
-        """
-        Объединяет результаты vector search и BM25.
-        Если chunk найден двумя способами, сохраняем оба score.
-        """
         combined: dict[int, dict] = {}
 
         def add_result(result: dict) -> None:
@@ -729,19 +619,6 @@ class RAGEngine:
         question: str,
         candidates: list[dict],
     ) -> list[dict]:
-        """
-        Локальный reranking найденных chunks.
-
-        Учитывает:
-        - vector_score
-        - bm25_score
-        - query expansion
-        - покрытие слов исходного запроса
-        - покрытие слов расширенного запроса
-        - точное совпадение фразы
-        - поля вида "Слоган:"
-        - найден ли chunk сразу двумя способами
-        """
         if not candidates:
             return []
 
@@ -765,7 +642,6 @@ class RAGEngine:
             vector_score = safe_float(item.get("vector_score"))
             bm25_score = safe_float(item.get("bm25_score"))
 
-            # Нормализация vector score.
             if vector_score <= 0:
                 vector_norm = 0.0
             elif vector_score >= settings.min_relevance_score:
@@ -777,32 +653,25 @@ class RAGEngine:
             else:
                 vector_norm = 0.0
 
-            # Нормализация BM25.
             bm25_norm = bm25_score / max_bm25 if max_bm25 else 0.0
 
-            # Покрытие исходного запроса.
             if original_token_set:
                 original_coverage = len(original_token_set.intersection(token_set)) / len(original_token_set)
             else:
                 original_coverage = 0.0
 
-            # Покрытие расширенного запроса.
             if expanded_token_set:
                 expanded_coverage = len(expanded_token_set.intersection(token_set)) / len(expanded_token_set)
             else:
                 expanded_coverage = 0.0
 
-            # Query expansion не должен перебивать исходный вопрос,
-            # поэтому исходное покрытие весит сильнее.
             coverage = 0.75 * original_coverage + 0.25 * expanded_coverage
 
-            # Бонус за точную фразу.
             exact_phrase_bonus = 0.0
 
             if normalized_question and normalized_question in normalized_text:
                 exact_phrase_bonus = 0.15
 
-            # Бонус за поля вида "слоган:", "состав:".
             field_bonus = 0.0
 
             for token in original_tokens:
@@ -815,7 +684,6 @@ class RAGEngine:
 
             field_bonus = min(field_bonus, 0.25)
 
-            # Бонус за важные поля.
             important_bonus = 0.0
             matched_important = IMPORTANT_FIELDS.intersection(expanded_token_set)
 
@@ -825,17 +693,14 @@ class RAGEngine:
 
             important_bonus = min(important_bonus, 0.15)
 
-            # Бонус, если query expansion реально помог найти совпадение.
             expansion_bonus = 0.0
 
             if expanded_only_token_set.intersection(token_set):
                 expansion_bonus = 0.08
 
-            # Бонус, если chunk найден и в vector, и в BM25.
             search_types = item.get("search_types", set())
             both_search_bonus = 0.10 if len(search_types) > 1 else 0.0
 
-            # Финальный rerank score.
             rerank_score = (
                 0.48 * vector_norm
                 + 0.34 * bm25_norm
@@ -867,14 +732,6 @@ class RAGEngine:
         question: str,
         question_vector: np.ndarray,
     ) -> list[dict]:
-        """
-        Новый поиск:
-        1. Vector search
-        2. BM25 search с query expansion
-        3. Merge candidates
-        4. Reranking
-        5. TOP_K лучших chunks
-        """
         candidate_limit = max(settings.top_k * 5, 25)
 
         vector_results = await self.vector_search(
@@ -900,12 +757,245 @@ class RAGEngine:
         return reranked[: settings.top_k]
 
     async def debug_search(self, question: str) -> list[dict]:
-        """
-        Поиск chunks без генерации ответа.
-        Используется командой /debug_search.
-        """
         question_vector = await self._embed_query(question)
         return await self.search(question=question, question_vector=question_vector)
+
+    async def _get_context_for_task(self, topic: str) -> tuple[str, list[dict]]:
+        """
+        Получает релевантный контекст из базы знаний для /training и /quiz.
+        """
+        question_vector = await self._embed_query(topic)
+
+        hits = await self.search(
+            question=topic,
+            question_vector=question_vector,
+        )
+
+        if not hits:
+            return "", []
+
+        context = "\n\n".join(
+            f"[Источник {i}]\n"
+            f"Файл: {hit['file_name']}\n"
+            f"Страница: {hit['page']}\n"
+            f"Текст:\n{hit['text']}"
+            for i, hit in enumerate(hits, start=1)
+        )
+
+        return context, hits
+
+    async def generate_training_module(self, topic: str) -> str:
+        """
+        Генерирует обучающий модуль для медицинского представителя.
+        Ответ строится строго по базе знаний.
+        """
+        context, _hits = await self._get_context_for_task(topic)
+
+        if not context:
+            return "В базе знаний нет информации для подготовки обучающего модуля по этой теме."
+
+        user_prompt = f"""
+CONTEXT:
+{context}
+
+ЗАДАЧА:
+Подготовь обучающий мини-модуль для медицинского представителя фармацевтической компании по теме: "{topic}".
+
+Структура ответа:
+1. Краткое описание темы
+2. Что медицинский представитель должен обязательно знать
+3. Ключевые сообщения для коммуникации с врачом
+4. Как объяснить тему простыми словами
+5. Возможные вопросы врача
+6. Краткий чек-лист для самопроверки
+
+Правила:
+- Используй только информацию из CONTEXT.
+- Не добавляй медицинские факты, которых нет в CONTEXT.
+- Не давай off-label рекомендаций.
+- Пиши понятно и прикладно.
+""".strip()
+
+        response = await self.client.chat.completions.create(
+            model=settings.chat_model,
+            temperature=0,
+            max_tokens=settings.max_answer_tokens,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        answer_text = (response.choices[0].message.content or "").strip()
+
+        if not answer_text:
+            return "Не удалось сформировать обучающий модуль по найденным данным."
+
+        return answer_text
+
+    async def generate_quiz_questions(self, topic: str, count: int = 5) -> list[dict]:
+        """
+        Генерирует вопросы для проверки знаний по теме.
+        """
+        context, _hits = await self._get_context_for_task(topic)
+
+        if not context:
+            return []
+
+        user_prompt = f"""
+CONTEXT:
+{context}
+
+ЗАДАЧА:
+Составь {count} вопросов для проверки знаний медицинского представителя по теме: "{topic}".
+
+Требования:
+- Вопросы должны проверять знание информации из CONTEXT.
+- Не используй факты, которых нет в CONTEXT.
+- Вопросы должны быть прикладными для медицинского представителя.
+- Для каждого вопроса дай эталонный ответ.
+
+Верни результат строго в JSON-формате:
+{{
+  "questions": [
+    {{
+      "question": "текст вопроса",
+      "expected_answer": "эталонный ответ"
+    }}
+  ]
+}}
+""".strip()
+
+        response = await self.client.chat.completions.create(
+            model=settings.chat_model,
+            temperature=0,
+            max_tokens=settings.max_answer_tokens,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        raw_text = (response.choices[0].message.content or "").strip()
+
+        if not raw_text:
+            return []
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            logger.exception("Не удалось разобрать JSON с quiz-вопросами")
+            return []
+
+        questions = data.get("questions", [])
+
+        if not isinstance(questions, list):
+            return []
+
+        result: list[dict] = []
+
+        for item in questions:
+            if not isinstance(item, dict):
+                continue
+
+            question = str(item.get("question", "")).strip()
+            expected_answer = str(item.get("expected_answer", "")).strip()
+
+            if not question or not expected_answer:
+                continue
+
+            result.append(
+                {
+                    "question": question,
+                    "expected_answer": expected_answer,
+                }
+            )
+
+        return result[:count]
+
+    async def evaluate_quiz_answer(
+        self,
+        quiz_question: str,
+        expected_answer: str,
+        user_answer: str,
+    ) -> dict:
+        """
+        Проверяет ответ пользователя на quiz-вопрос.
+        """
+        user_prompt = f"""
+ВОПРОС:
+{quiz_question}
+
+ЭТАЛОННЫЙ ОТВЕТ:
+{expected_answer}
+
+ОТВЕТ ПОЛЬЗОВАТЕЛЯ:
+{user_answer}
+
+ЗАДАЧА:
+Оцени, насколько ответ пользователя соответствует эталонному ответу.
+
+Верни строго JSON:
+{{
+  "score": число от 0 до 1,
+  "is_correct": true или false,
+  "feedback": "краткий комментарий для пользователя"
+}}
+
+Критерии:
+- 1.0 — полностью верно
+- 0.5-0.9 — частично верно
+- ниже 0.5 — неверно или недостаточно
+""".strip()
+
+        response = await self.client.chat.completions.create(
+            model=settings.chat_model,
+            temperature=0,
+            max_tokens=400,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты тренер медицинских представителей. "
+                        "Оценивай ответы строго по эталонному ответу. "
+                        "Не добавляй внешние медицинские знания."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        raw_text = (response.choices[0].message.content or "").strip()
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            logger.exception("Не удалось разобрать JSON оценки quiz-ответа")
+            return {
+                "score": 0.0,
+                "is_correct": False,
+                "feedback": "Не удалось автоматически оценить ответ.",
+            }
+
+        try:
+            score = float(data.get("score", 0.0))
+        except Exception:
+            score = 0.0
+
+        score = max(0.0, min(1.0, score))
+        is_correct = bool(data.get("is_correct", score >= 0.7))
+        feedback = str(data.get("feedback", "")).strip()
+
+        if not feedback:
+            feedback = "Ответ проверен."
+
+        return {
+            "score": score,
+            "is_correct": is_correct,
+            "feedback": feedback,
+        }
 
     async def answer(self, question: str) -> str:
         exact_cache_hit = self.cache.find_exact(question)
@@ -979,8 +1069,6 @@ QUESTION:
             used.add(key)
             sources.append(f"• {hit['file_name']}, стр. {hit['page']}")
 
-        # Источники добавляются в технический ответ,
-        # но bot.py скрывает их от пользователя и сохраняет в логи.
         final_answer = f"{answer_text}\n\n📎 Источники:\n" + "\n".join(sources)
 
         self.cache.add(

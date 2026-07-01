@@ -25,12 +25,10 @@ rag_engine: RAGEngine | None = None
 auth_store: AuthStore | None = None
 analytics_store: AnalyticsStore | None = None
 
+quiz_sessions: dict[int, dict] = {}
+
 
 def split_for_telegram(text: str, limit: int = 3900) -> list[str]:
-    """
-    Telegram ограничивает длину одного сообщения.
-    Делим длинный ответ на части.
-    """
     parts: list[str] = []
 
     while len(text) > limit:
@@ -130,13 +128,6 @@ def feedback_keyboard(answer_id: str) -> InlineKeyboardMarkup:
 
 
 def extract_sources_from_answer(answer: str) -> list[str]:
-    """
-    Достаёт источники из текста ответа.
-
-    Ожидаемый формат:
-    📎 Источники:
-    • file.pdf, стр. 3
-    """
     marker = "📎 Источники:"
 
     if marker not in answer:
@@ -161,18 +152,6 @@ def extract_sources_from_answer(answer: str) -> list[str]:
 
 
 def remove_sources_from_answer(answer: str) -> str:
-    """
-    Убирает блок источников из ответа перед отправкой пользователю.
-
-    Было:
-    Ответ...
-
-    📎 Источники:
-    • file.pdf, стр. 3
-
-    Станет:
-    Ответ...
-    """
     marker = "📎 Источники:"
 
     if marker not in answer:
@@ -194,6 +173,19 @@ def expected_paths_text() -> str:
         f"chunks.json: <code>{escape(str(chunks_path))}</code>\n"
         f"cache: <code>{escape(str(cache_path))}</code>"
     )
+
+
+def get_quiz_recommendation(avg_score: float) -> str:
+    if avg_score >= 0.85:
+        return "Отличный результат. Тему можно считать хорошо освоенной."
+
+    if avg_score >= 0.65:
+        return "Хороший результат, но стоит повторить отдельные детали."
+
+    if avg_score >= 0.45:
+        return "Рекомендуется повторить материал и пройти quiz ещё раз."
+
+    return "Тему нужно повторить заново. Начните с команды /training по этой теме."
 
 
 async def notify_admins_about_request(bot: Bot, user_record: dict) -> None:
@@ -343,7 +335,10 @@ async def cmd_help(message: Message) -> None:
         "3. Ответ будет сформирован только по найденным фрагментам.\n\n"
         "Основные команды:\n"
         "/id — узнать свой Telegram user_id\n"
-        "/help — помощь\n\n"
+        "/help — помощь\n"
+        "/training тема — обучающий модуль по теме\n"
+        "/quiz тема — проверка знаний по теме\n"
+        "/stop_quiz — остановить проверку знаний\n\n"
         "Админ-команды RAG:\n"
         "/status — статус базы знаний\n"
         "/reload — перезагрузить базу без перезапуска контейнера\n"
@@ -360,6 +355,228 @@ async def cmd_help(message: Message) -> None:
         "/popular — популярные запросы\n"
         "/feedback — последние негативные оценки"
     )
+
+
+async def cmd_training(message: Message) -> None:
+    global rag_engine
+
+    if not await ensure_access(message):
+        return
+
+    topic = get_command_arg(message)
+
+    if not topic:
+        await message.answer(
+            "Укажите тему обучения.\n\n"
+            "Пример:\n"
+            "<code>/training Вирфертил Актив</code>\n\n"
+            "Или:\n"
+            "<code>/training состав продукта</code>"
+        )
+        return
+
+    if rag_engine is None:
+        await message.answer("⚠️ База знаний ещё не загружена.")
+        return
+
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        training_text = await rag_engine.generate_training_module(topic)
+    except Exception as exc:
+        logger.exception("Ошибка при генерации training")
+        await message.answer(f"❌ Не удалось подготовить обучение: <code>{escape(str(exc))}</code>")
+        return
+
+    for part in split_for_telegram(training_text):
+        await message.answer(part)
+
+
+async def cmd_quiz(message: Message) -> None:
+    global rag_engine
+    global quiz_sessions
+
+    if not await ensure_access(message):
+        return
+
+    user_id = get_user_id(message)
+
+    if user_id is None:
+        await message.answer("Не удалось определить ваш Telegram user_id.")
+        return
+
+    topic = get_command_arg(message)
+
+    if not topic:
+        await message.answer(
+            "Укажите тему для проверки знаний.\n\n"
+            "Пример:\n"
+            "<code>/quiz Вирфертил Актив</code>\n\n"
+            "Или:\n"
+            "<code>/quiz ключевые преимущества</code>"
+        )
+        return
+
+    if rag_engine is None:
+        await message.answer("⚠️ База знаний ещё не загружена.")
+        return
+
+    await message.answer("🧪 Готовлю вопросы для проверки знаний...")
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        questions = await rag_engine.generate_quiz_questions(topic=topic, count=5)
+    except Exception as exc:
+        logger.exception("Ошибка при генерации quiz")
+        await message.answer(f"❌ Не удалось подготовить quiz: <code>{escape(str(exc))}</code>")
+        return
+
+    if not questions:
+        await message.answer(
+            "Не удалось подготовить вопросы по этой теме. "
+            "Возможно, в базе знаний недостаточно информации."
+        )
+        return
+
+    quiz_sessions[user_id] = {
+        "topic": topic,
+        "questions": questions,
+        "current_index": 0,
+        "correct_count": 0,
+        "scores": [],
+    }
+
+    first_question = questions[0]["question"]
+
+    await message.answer(
+        "🧪 Проверка знаний началась.\n\n"
+        f"Тема: <b>{escape(topic)}</b>\n"
+        f"Всего вопросов: <code>{len(questions)}</code>\n\n"
+        "Отвечайте обычным сообщением.\n"
+        "Чтобы завершить quiz досрочно, напишите /stop_quiz.\n\n"
+        f"Вопрос 1/{len(questions)}:\n{escape(first_question)}"
+    )
+
+
+async def cmd_stop_quiz(message: Message) -> None:
+    global quiz_sessions
+
+    if not await ensure_access(message):
+        return
+
+    user_id = get_user_id(message)
+
+    if user_id is None:
+        await message.answer("Не удалось определить ваш Telegram user_id.")
+        return
+
+    if user_id not in quiz_sessions:
+        await message.answer("У вас нет активной проверки знаний.")
+        return
+
+    quiz_sessions.pop(user_id, None)
+
+    await message.answer("🛑 Проверка знаний остановлена.")
+
+
+async def handle_quiz_answer(message: Message) -> bool:
+    global rag_engine
+    global quiz_sessions
+
+    user_id = get_user_id(message)
+
+    if user_id is None:
+        return False
+
+    if user_id not in quiz_sessions:
+        return False
+
+    if rag_engine is None:
+        await message.answer("⚠️ База знаний ещё не загружена.")
+        return True
+
+    session = quiz_sessions[user_id]
+    questions = session["questions"]
+    current_index = session["current_index"]
+
+    if current_index >= len(questions):
+        quiz_sessions.pop(user_id, None)
+        return True
+
+    user_answer = (message.text or "").strip()
+
+    if not user_answer:
+        await message.answer("Пришлите ответ текстом.")
+        return True
+
+    current_question = questions[current_index]
+    quiz_question = current_question["question"]
+    expected_answer = current_question["expected_answer"]
+
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        evaluation = await rag_engine.evaluate_quiz_answer(
+            quiz_question=quiz_question,
+            expected_answer=expected_answer,
+            user_answer=user_answer,
+        )
+    except Exception as exc:
+        logger.exception("Ошибка при оценке quiz-ответа")
+        await message.answer(f"❌ Не удалось оценить ответ: <code>{escape(str(exc))}</code>")
+        return True
+
+    score = float(evaluation.get("score", 0.0))
+    is_correct = bool(evaluation.get("is_correct", score >= 0.7))
+    feedback = str(evaluation.get("feedback", "")).strip()
+
+    session["scores"].append(score)
+
+    if is_correct:
+        session["correct_count"] += 1
+        result_icon = "✅"
+        result_text = "Верно"
+    elif score >= 0.5:
+        result_icon = "⚠️"
+        result_text = "Частично верно"
+    else:
+        result_icon = "❌"
+        result_text = "Неверно"
+
+    await message.answer(
+        f"{result_icon} {result_text}\n\n"
+        f"Оценка: <code>{round(score, 2)}</code>\n\n"
+        f"Комментарий:\n{escape(feedback)}"
+    )
+
+    session["current_index"] += 1
+    next_index = session["current_index"]
+
+    if next_index >= len(questions):
+        correct_count = session["correct_count"]
+        total = len(questions)
+        avg_score = sum(session["scores"]) / total if total else 0.0
+        topic = session["topic"]
+
+        quiz_sessions.pop(user_id, None)
+
+        await message.answer(
+            "🏁 Проверка знаний завершена.\n\n"
+            f"Тема: <b>{escape(topic)}</b>\n"
+            f"Результат: <code>{correct_count}/{total}</code>\n"
+            f"Средний score: <code>{round(avg_score, 2)}</code>\n\n"
+            f"{get_quiz_recommendation(avg_score)}"
+        )
+        return True
+
+    next_question = questions[next_index]["question"]
+
+    await message.answer(
+        f"Вопрос {next_index + 1}/{len(questions)}:\n"
+        f"{escape(next_question)}"
+    )
+
+    return True
 
 
 async def cmd_status(message: Message) -> None:
@@ -400,6 +617,9 @@ async def cmd_status(message: Message) -> None:
             f"\nBM25 docs: <code>{status['bm25_docs']}</code>"
             f"\nBM25 avg doc len: <code>{status['bm25_avg_doc_len']}</code>"
         )
+
+    if "query_expansion_terms" in status:
+        text += f"\nQuery expansion terms: <code>{status['query_expansion_terms']}</code>"
 
     await message.answer(text)
 
@@ -891,7 +1111,6 @@ async def handle_feedback_callback(callback: CallbackQuery) -> None:
     else:
         await callback.answer("Спасибо. Я сохранил этот ответ для проверки 👎")
 
-    # Убираем кнопки, чтобы пользователь не нажимал несколько раз
     if callback.message:
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -904,6 +1123,9 @@ async def handle_question(message: Message) -> None:
     global analytics_store
 
     if not await ensure_access(message):
+        return
+
+    if await handle_quiz_answer(message):
         return
 
     question = (message.text or "").strip()
@@ -929,10 +1151,7 @@ async def handle_question(message: Message) -> None:
         await message.answer(f"Произошла ошибка: {exc}")
         return
 
-    # Источники сохраняем для логов и feedback
     sources = extract_sources_from_answer(full_answer)
-
-    # Пользователю отправляем ответ без блока "📎 Источники"
     visible_answer = remove_sources_from_answer(full_answer)
 
     answer_id: str | None = None
@@ -1001,15 +1220,16 @@ async def main() -> None:
     # Команды, доступные всем
     dp.message.register(cmd_id, Command("id"))
 
-    # Callback-кнопки авторизации
+    # Callback-кнопки
     dp.callback_query.register(handle_auth_callback, F.data.startswith("auth:"))
-
-    # Callback-кнопки оценки ответов
     dp.callback_query.register(handle_feedback_callback, F.data.startswith("fb:"))
 
     # Обычные команды
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
+    dp.message.register(cmd_training, Command("training"))
+    dp.message.register(cmd_quiz, Command("quiz"))
+    dp.message.register(cmd_stop_quiz, Command("stop_quiz"))
 
     # Админ-команды эксплуатации RAG
     dp.message.register(cmd_status, Command("status"))
@@ -1029,7 +1249,7 @@ async def main() -> None:
     dp.message.register(cmd_popular, Command("popular"))
     dp.message.register(cmd_feedback, Command("feedback"))
 
-    # Все остальные текстовые сообщения — вопросы к RAG
+    # Все остальные текстовые сообщения
     dp.message.register(handle_question, F.text)
 
     try:
